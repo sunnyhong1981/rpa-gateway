@@ -28,7 +28,7 @@ if not (state/'cert.pem').exists():
 # Match production routing but use independently started local services.
 nginx=(root/'deploy/nginx-scale.conf').read_text().replace('/etc/nginx/mime.types','/opt/homebrew/etc/nginx/mime.types')
 nginx=nginx.replace('/run/tls/',str(state)+'/').replace('gateway-a:8080','127.0.0.1:38081').replace('gateway-b:8080','127.0.0.1:38082')
-nginx=nginx.replace('media:8080','127.0.0.1:38083').replace('http://objects:9000','http://127.0.0.1:39000')
+nginx=nginx.replace('media:8080','127.0.0.1:38083').replace('objects:9000','127.0.0.1:39000')
 nginx=nginx.replace('listen 8080;','listen 127.0.0.1:38080;').replace('listen 8443 ssl;','listen 127.0.0.1:38443 ssl;').replace('listen 8444 ssl;','listen 127.0.0.1:38444 ssl;')
 nginx=nginx.replace('/tmp/nginx.pid',str(state/'nginx.pid')).replace('/tmp/client',str(state/'client-temp')).replace('/tmp/proxy',str(state/'proxy-temp'))
 nginx=nginx.replace('worker_processes auto','worker_processes 2')
