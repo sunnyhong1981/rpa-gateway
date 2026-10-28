@@ -1,0 +1,83 @@
+"""PostgreSQL-only runtime storage. SQLite is read only by the explicit importer."""
+import re
+from contextlib import contextmanager
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+SCHEMA_VERSION = 1
+TABLES = ('devices','media','tasks','events','archive_claims')
+DDL = '''
+CREATE TABLE IF NOT EXISTS gateway_schema (version INTEGER PRIMARY KEY);
+CREATE TABLE IF NOT EXISTS devices (
+ tenant TEXT NOT NULL, id TEXT NOT NULL UNIQUE, token_hash TEXT UNIQUE NOT NULL,
+ scope TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0 CHECK(revoked IN (0,1)),
+ session TEXT, installation TEXT, hello TEXT, heartbeat TEXT, seen DOUBLE PRECISION,
+ PRIMARY KEY(tenant,id));
+CREATE TABLE IF NOT EXISTS media (
+ tenant TEXT NOT NULL, id TEXT NOT NULL, sha256 TEXT NOT NULL, md5 TEXT NOT NULL,
+ size BIGINT NOT NULL, mime TEXT NOT NULL, data BYTEA NOT NULL,
+ PRIMARY KEY(tenant,id), UNIQUE(tenant,sha256));
+CREATE TABLE IF NOT EXISTS tasks (
+ tenant TEXT NOT NULL, id TEXT PRIMARY KEY, device TEXT NOT NULL,
+ dedup TEXT NOT NULL, payload TEXT NOT NULL, state TEXT NOT NULL,
+ created DOUBLE PRECISION NOT NULL, deadline DOUBLE PRECISION NOT NULL,
+ lease_token TEXT, lease_until DOUBLE PRECISION, session TEXT,
+ intent_at DOUBLE PRECISION, submitted_at DOUBLE PRECISION, updated DOUBLE PRECISION NOT NULL,
+ UNIQUE(tenant,dedup), FOREIGN KEY(tenant,device) REFERENCES devices(tenant,id));
+CREATE INDEX IF NOT EXISTS tasks_device_state ON tasks(tenant,device,state,created,id);
+CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_per_device ON tasks(tenant,device)
+ WHERE state IN ('leased','submitting','submitted','unknown');
+CREATE INDEX IF NOT EXISTS tasks_deadline ON tasks(deadline,tenant,device)
+ WHERE state IN ('queued','leased');
+CREATE INDEX IF NOT EXISTS tasks_lease_due ON tasks(lease_until,tenant,device)
+ WHERE state IN ('leased','submitting','submitted');
+CREATE TABLE IF NOT EXISTS events (
+ seq BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL, task TEXT NOT NULL,
+ event_id TEXT NOT NULL, at DOUBLE PRECISION NOT NULL, state TEXT NOT NULL, details TEXT NOT NULL,
+ UNIQUE(task,event_id), FOREIGN KEY(task) REFERENCES tasks(id));
+CREATE TABLE IF NOT EXISTS archive_claims (
+ tenant TEXT NOT NULL, event_id TEXT NOT NULL, task TEXT NOT NULL,
+ PRIMARY KEY(tenant,event_id), FOREIGN KEY(task) REFERENCES tasks(id));
+CREATE TABLE IF NOT EXISTS gateway_imports (
+ source_sha256 TEXT PRIMARY KEY, imported_at TIMESTAMPTZ NOT NULL DEFAULT now(), summary TEXT NOT NULL);
+'''
+
+
+class Database:
+    def __init__(self, dsn, pool_size=8):
+        # Fail closed on absent DSNs and on accidentally using Chatwoot's business DB.
+        values = conninfo_to_dict(dsn)
+        if not re.fullmatch(r'rpa_gateway(?:_test)?',values.get('dbname','')):
+            raise ValueError('A dedicated rpa_gateway or rpa_gateway_test PostgreSQL database is required')
+        if not 1 <= pool_size <= 16:
+            raise ValueError('Database pool must contain 1 to 16 connections')
+        def configure(conn):
+            conn.execute("SET statement_timeout='5s'")
+            conn.execute("SET lock_timeout='2s'")
+            conn.execute("SET idle_in_transaction_session_timeout='10s'")
+        self.pool = ConnectionPool(make_conninfo(dsn,connect_timeout=5,application_name='qunl-rpa-gateway'),
+            min_size=1,max_size=pool_size,timeout=5,max_waiting=64,open=True,
+            configure=configure,kwargs={'autocommit':True,'row_factory':dict_row})
+        self.pool.wait(timeout=10)
+
+    @contextmanager
+    def transaction(self):
+        with self.pool.connection() as conn:
+            with conn.transaction():
+                yield conn
+
+    def initialize(self):
+        with self.transaction() as db:
+            # Serialize DDL within this dedicated DB/schema, never lock Chatwoot tables.
+            db.execute("SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext(current_schema() || ':rpa_gateway_schema'))")
+            for statement in DDL.split(';'):
+                if statement.strip():
+                    db.execute(statement)
+            versions = [row['version'] for row in db.execute('SELECT version FROM gateway_schema')]
+            if versions and versions != [SCHEMA_VERSION]:
+                raise RuntimeError('Unsupported gateway database schema')
+            db.execute('INSERT INTO gateway_schema(version) VALUES(%s) ON CONFLICT DO NOTHING',(SCHEMA_VERSION,))
+
+    def close(self):
+        self.pool.close()

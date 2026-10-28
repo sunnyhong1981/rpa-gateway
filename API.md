@@ -6,7 +6,7 @@
 
 | 角色 | 请求 | 用途 |
 | --- | --- | --- |
-| 无 | GET `/healthz` | 存活及 SQLite 可写探测、版本、隔离模式 |
+| 无 | GET `/healthz` | 存活及 PostgreSQL 连接探测、版本、存储类型、隔离模式 |
 | admin | GET `/openapi.json` | OpenAPI 结构 |
 | admin | POST `/v1/admin/{tenant}/devices` | 创建设备，仅首次返回随机设备 token |
 | admin | POST `/v1/admin/{tenant}/devices/{id}/rotate` | 轮换，旧令牌和会话立即失效 |

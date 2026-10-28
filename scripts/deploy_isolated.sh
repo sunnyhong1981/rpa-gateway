@@ -23,5 +23,6 @@ Path('baseline-services.json').write_text(json.dumps({r['Names']:r['ID'] for r i
 PY
 python3 scripts/init_runtime.py
 chown 10001:10001 runtime/data runtime/secrets/admin_token runtime/secrets/backend_token runtime/secrets/verifier_token
+python3 scripts/bootstrap_postgres_host.py
 docker compose -f deploy/compose.yaml build gateway
 docker compose -f deploy/compose.yaml up -d --no-deps gateway

@@ -1,4 +1,10 @@
 import io
+import os
+import uuid
+from pathlib import Path
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo, conninfo_to_dict
 import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -10,9 +16,25 @@ class Clock:
     def advance(self, seconds): self.now+=seconds
 
 @pytest.fixture
-def env(tmp_path):
+def database_dsn():
+    path=os.environ.get('RPA_GATEWAY_TEST_DSN_FILE')
+    if not path:
+        pytest.fail('RPA_GATEWAY_TEST_DSN_FILE must point to a private PostgreSQL test credential')
+    dsn=Path(path).read_text().strip()
+    if conninfo_to_dict(dsn).get('dbname')!='rpa_gateway_test':
+        pytest.fail('Tests require the dedicated rpa_gateway_test database')
+    schema='test_'+uuid.uuid4().hex
+    with psycopg.connect(dsn,autocommit=True) as admin:
+        admin.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(schema)))
+        try:
+            yield make_conninfo(dsn, options='-c search_path='+schema)
+        finally:
+            admin.execute(sql.SQL('DROP SCHEMA {} CASCADE').format(sql.Identifier(schema)))
+
+@pytest.fixture
+def env(database_dsn):
     clock=Clock()
-    settings=Settings(str(tmp_path/'gateway.sqlite3'),'a'*48,'b'*48,'v'*48)
+    settings=Settings(database_dsn,'a'*48,'b'*48,'v'*48)
     app=create_app(settings,clock)
     with TestClient(app) as client:
         yield Harness(client,settings,clock,app)

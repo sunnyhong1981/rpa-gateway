@@ -1,6 +1,6 @@
 # QUNL RPA 网关
 
-独立的设备接入、任务派发和执行回执服务。第一版采用**隔离试运行**：没有 Chatwoot、查件服务或官方存档的连接凭证，没有读取旧 RPA 队列的代码，也不会操作企业微信、剪贴板或桌面。正式客户端继续按原有方式工作。
+独立的设备接入、任务派发和执行回执服务。当前 v0.2.0 采用**隔离试运行**：没有 Chatwoot、查件服务或官方存档的连接凭证，没有读取旧 RPA 队列的代码，也不会操作企业微信、剪贴板或桌面。正式客户端继续按原有方式工作。
 
 ## 当前部署
 
@@ -8,8 +8,9 @@
 - 目录：`/opt/ai/rpa-gateway`。
 - Compose 项目：`qunl-rpa-gateway`，唯一服务 `gateway`。
 - 入口：服务器本机 `http://127.0.0.1:31080`。
-- 独立 SQLite：`runtime/data/gateway.sqlite3`，WAL + FULL 同步。
-- 独立 Docker bridge 网络，不加入 Chatwoot 的网络；应用未配置任何业务后端连接。
+- PostgreSQL：与 Chatwoot 共用 `chatwoot-postgres-1` 实例，网关独立数据库和账号均为 `rpa_gateway`，不使用 Chatwoot 业务表或账号。
+- PostgreSQL 应用连接池：1～8 个连接；专用账号总连接上限 16。
+- 独立 Docker bridge 网络，PostgreSQL 额外接入此网络；保留 Chatwoot 原有网络、地址和连接，应用尚未接入其业务接口。
 - 未新增公网入口或域名，未改动现有 Nginx、安全组和防火墙配置；Docker 仅建立本网关的回环端口映射。
 
 从开发机访问：
@@ -91,20 +92,21 @@ unknown --人工审计关闭--> closed_unconfirmed
 ```bash
 python3 -m venv .venv
 .venv/bin/pip install -r requirements-dev.txt
-.venv/bin/python -m pytest -q
+RPA_GATEWAY_TEST_DSN_FILE=runtime/secrets/test_database_url .venv/bin/python -m pytest -q
 ```
 
-开发用临时目录通过 `Settings(database, admin_token, backend_token, verifier_token)` 启动；三种控制令牌必须各不相同、至少 32 字符。仓库无内置默认密码。测试自建临时数据库，不读已安装 RPA 的配置。
+通过 `Settings(postgresql_dsn, admin_token, backend_token, verifier_token)` 启动；三种控制令牌必须各不相同、至少 32 字符。仓库无内置默认密码。测试只允许 `rpa_gateway_test` 数据库，每项测试创建和清理独立 schema，不读已安装 RPA 的配置。生产运行只使用 PostgreSQL；不会在连接失败时自动回退 SQLite。
 
 ## 部署及停用
 
-`requirements.txt` 固定运行依赖版本；`requirements-dev.txt` 增加测试依赖。服务仅支持单容器单 worker；当前没有跨主机高可用或横向扩容。
+`requirements.txt` 固定运行依赖版本；`requirements-dev.txt` 增加测试依赖。当前仍以单容器单 worker 隔离运行；存储已具备跨实例事务控制，但 WebSocket 事件推送、Redis 和千台性能验收尚未完成，不能据此宣称已支持 1000 台。
 
 首次部署，在新目录中执行：
 
 ```bash
 python3 scripts/init_runtime.py
 sudo chown 10001:10001 runtime/data runtime/secrets/*_token
+sudo python3 scripts/bootstrap_postgres_host.py
 docker compose -f deploy/compose.yaml build gateway
 docker compose -f deploy/compose.yaml up -d --no-deps gateway
 ```
@@ -120,7 +122,11 @@ docker compose -f deploy/compose.yaml logs --tail 50 gateway
 docker compose -f deploy/compose.yaml stop gateway
 ```
 
-只停止本网关即可撤销试运行，不操作其他 Compose 项目，不删除 `runtime`。运行中的 SQLite 不可直接复制主文件备份，使用 SQLite online backup；恢复前停网关并保留当前数据，不能恢复旧快照后重放已提交任务。密钥目录另做加密备份。
+只停止本网关即可撤销试运行，不操作其他 Compose 项目，不删除 `runtime`。备份使用 PostgreSQL `pg_dump` 或现有实例的备份体系，并单独保护网关密钥。旧 SQLite 及切换前 online-backup 快照仅作历史留档，切换后不再写入；禁止恢复旧快照重放已提交任务。
+
+数据库连接串保存在 `runtime/secrets/database_url`，由 Docker secret 以 `RPA_GATEWAY_DATABASE_URL_FILE` 注入，禁止把密码写入 Compose、日志或 Git。生产库名必须为 `rpa_gateway`；误指向 `chatwoot` 或 `postgres` 会拒绝启动。
+
+迁移工具 `scripts/migrate_sqlite_to_postgres.py` 只导入显式 SQLite 快照：先校验完整性，再在单一 PostgreSQL 事务中复制五张表、逐表比对条数和内容摘要、恢复事件序列。目标必须为空，失败整笔回滚；同一源重试不重置已运行的状态。已提交及 unknown 状态原样保留，不重新派发。
 
 首版保留任务和图片用于审计，没有自动清理或自动扩盘。接入生产前须确定媒体保存期限、备份、磁盘监控和告警；不应无限存储业务照片。
 

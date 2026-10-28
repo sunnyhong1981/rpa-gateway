@@ -1,5 +1,9 @@
 *
 !requirements.txt
+!requirements-dev.txt
+!pyproject.toml
 !rpa_gateway/
 !rpa_gateway/*.py
+!tests/
+!tests/*.py
 **/._*

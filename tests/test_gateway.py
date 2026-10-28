@@ -1,7 +1,6 @@
 import concurrent.futures
 import hashlib
 import json
-import sqlite3
 import pytest
 from fastapi.testclient import TestClient
 from rpa_gateway.app import Settings, create_app
@@ -282,8 +281,8 @@ def test_active_resume_does_not_claim_or_resend(env):
 
 def test_persisted_db_contains_hash_not_device_credential(env):
     d=env.register()
-    with sqlite3.connect(env.settings.database) as db:
-        value=db.execute('SELECT token_hash FROM devices').fetchone()[0]
+    with env.app.state.store.transaction() as db:
+        value=db.execute('SELECT token_hash FROM devices').fetchone()['token_hash']
     assert value!=d['headers']['Authorization'][7:]
     assert len(value)==64
 

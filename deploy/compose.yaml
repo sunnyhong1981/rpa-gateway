@@ -1,9 +1,10 @@
 name: qunl-rpa-gateway
 services:
   gateway:
-    image: qunl-rpa-gateway:0.1.0
+    image: qunl-rpa-gateway:0.2.0
     build:
       context: ..
+      target: runtime
     restart: unless-stopped
     init: true
     read_only: true
@@ -11,7 +12,7 @@ services:
     ports:
       - "127.0.0.1:31080:8080"
     environment:
-      RPA_GATEWAY_DATABASE: /data/gateway.sqlite3
+      RPA_GATEWAY_DATABASE_URL_FILE: /run/secrets/database_url
       RPA_GATEWAY_ADMIN_TOKEN_FILE: /run/secrets/admin_token
       RPA_GATEWAY_BACKEND_TOKEN_FILE: /run/secrets/backend_token
       RPA_GATEWAY_VERIFIER_TOKEN_FILE: /run/secrets/verifier_token
@@ -19,6 +20,7 @@ services:
       - admin_token
       - backend_token
       - verifier_token
+      - database_url
     volumes:
       - ../runtime/data:/data
     networks:
@@ -49,6 +51,8 @@ secrets:
     file: ../runtime/secrets/backend_token
   verifier_token:
     file: ../runtime/secrets/verifier_token
+  database_url:
+    file: ../runtime/secrets/database_url
 networks:
   isolated:
     driver: bridge

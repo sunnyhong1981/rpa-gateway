@@ -6,7 +6,7 @@ import logging
 import os
 import warnings
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -25,10 +25,10 @@ Image.MAX_IMAGE_PIXELS = 30_000_000
 
 @dataclass(frozen=True)
 class Settings:
-    database: str
-    admin_token: str
-    backend_token: str
-    verifier_token: str
+    database: str = field(repr=False)
+    admin_token: str = field(repr=False)
+    backend_token: str = field(repr=False)
+    verifier_token: str = field(repr=False)
 
     def __post_init__(self):
         tokens = (self.admin_token, self.backend_token, self.verifier_token)
@@ -40,7 +40,7 @@ class Settings:
         def secret(name):
             path = os.environ.get(name + '_FILE')
             return Path(path).read_text().strip() if path else os.environ.get(name, '')
-        return cls(os.environ.get('RPA_GATEWAY_DATABASE', '/data/gateway.sqlite3'),
+        return cls(secret('RPA_GATEWAY_DATABASE_URL'),
                    secret('RPA_GATEWAY_ADMIN_TOKEN'),secret('RPA_GATEWAY_BACKEND_TOKEN'),secret('RPA_GATEWAY_VERIFIER_TOKEN'))
 
 
@@ -90,14 +90,17 @@ def create_app(settings=None, clock=None):
                 except Exception:
                     logging.exception('Gateway maintenance failed')
         task = asyncio.create_task(sweep_loop())
-        yield
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            yield
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            await run_in_threadpool(store.close)
 
-    app = FastAPI(title='QUNL RPA Gateway',version='0.1.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
+    app = FastAPI(title='QUNL RPA Gateway',version='0.2.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
     app.add_middleware(BodyLimit)
     app.state.store=store
     decode_slot=asyncio.Semaphore(1)
@@ -141,8 +144,8 @@ def create_app(settings=None, clock=None):
     def health():
         with store.transaction() as db:
             db.execute('SELECT 1').fetchone()
-        return {'service':'rpa-gateway','version':'0.1.0','mode':'isolated_opt_in','ready':True,
-                'legacy_connected':False}
+        return {'service':'rpa-gateway','version':'0.2.0','mode':'isolated_opt_in','ready':True,
+                'legacy_connected':False,'storage':'postgresql'}
 
     @app.get('/openapi.json',dependencies=[Depends(admin)])
     def schema():
@@ -219,11 +222,11 @@ def create_app(settings=None, clock=None):
     @app.get('/v1/device/active')
     def active(session_id:str,current=Depends(device)):
         with store.transaction() as db:
-            store.session(db,current,session_id)
-            store.sweep(db)
-            rows=db.execute("SELECT * FROM tasks WHERE tenant=? AND device=? AND session=? AND state IN ('leased','submitting','submitted','unknown')",
+            owner=store.session(db,current,session_id,lock=True)
+            store.sweep(db,owner)
+            rows=db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND session=%s AND state IN ('leased','submitting','submitted','unknown')",
                             (current['tenant'],current['id'],session_id)).fetchall()
-            return {'tasks':[store.present(row,device_view=True) for row in rows],
+            return {'tasks':[store.present(row,device_view=True,db=db) for row in rows],
                     'instruction':'Resume only leased tasks after renewing; reconcile submitting/submitted/unknown without resending'}
 
     @app.post('/v1/device/tasks/{task_id}/receipts')
@@ -253,7 +256,7 @@ def create_app(settings=None, clock=None):
                 def snapshot():
                     with store.transaction() as db:
                         store.session(db,current,sid)
-                        rows=db.execute('SELECT id,state,updated FROM tasks WHERE tenant=? AND device=? ORDER BY created DESC LIMIT 100',
+                        rows=db.execute('SELECT id,state,updated FROM tasks WHERE tenant=%s AND device=%s ORDER BY created DESC LIMIT 100',
                                         (current['tenant'],current['id'])).fetchall()
                         return [dict(row) for row in rows]
                 state=await run_in_threadpool(snapshot)
