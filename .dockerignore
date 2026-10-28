@@ -1,0 +1,5 @@
+*
+!requirements.txt
+!rpa_gateway/
+!rpa_gateway/*.py
+**/._*

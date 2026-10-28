@@ -1,0 +1,54 @@
+name: qunl-rpa-gateway
+services:
+  gateway:
+    image: qunl-rpa-gateway:0.1.0
+    build:
+      context: ..
+    restart: unless-stopped
+    init: true
+    read_only: true
+    user: "10001:10001"
+    ports:
+      - "127.0.0.1:31080:8080"
+    environment:
+      RPA_GATEWAY_DATABASE: /data/gateway.sqlite3
+      RPA_GATEWAY_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+      RPA_GATEWAY_BACKEND_TOKEN_FILE: /run/secrets/backend_token
+      RPA_GATEWAY_VERIFIER_TOKEN_FILE: /run/secrets/verifier_token
+    secrets:
+      - admin_token
+      - backend_token
+      - verifier_token
+    volumes:
+      - ../runtime/data:/data
+    networks:
+      - isolated
+    mem_limit: 384m
+    cpus: 0.5
+    pids_limit: 80
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+secrets:
+  admin_token:
+    file: ../runtime/secrets/admin_token
+  backend_token:
+    file: ../runtime/secrets/backend_token
+  verifier_token:
+    file: ../runtime/secrets/verifier_token
+networks:
+  isolated:
+    driver: bridge
