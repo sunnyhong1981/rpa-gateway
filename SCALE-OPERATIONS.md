@@ -107,4 +107,5 @@ docker compose -f deploy/scale.compose.yaml logs --tail 50 worker
 - `scripts/start_local_scale.py` 启动两个真实网关、独立媒体/worker、Nginx TLS 入口，绝不连接 Chatwoot 数据源。
 - `scripts/load_scale.py` 支持 clients/seconds/task-seconds 等参数，实建每设备凭证和连接，采集完整任务及通知指标；固定只允许回环性能环境。压力测试不能针对共享业务主机。
 - `scripts/fault_scale.py` 只操作自行创建的本地进程、Redis 和 PostgreSQL，验证跨实例通知、节点重启、Redis/DB 故障和提交记录恢复。
+- 压测 JSON 的 passed 表示连接、任务计数和无请求错误；延迟 SLO 必须另看 P95/P99，不能把两千台连接正确性通过写成全部性能达标。
 - 千台/两千台短时连接通过不能代替 1 小时和 24 小时 soak，更不能保证真实企业微信上传或官方存档延迟。长时间运行测试可通过增大 seconds 执行；本次报告应明确实测时长和负载机同机的局限。
