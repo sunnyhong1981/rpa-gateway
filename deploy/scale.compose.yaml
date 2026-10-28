@@ -1,0 +1,126 @@
+name: qunl-rpa-gateway-scale
+x-runtime: &runtime
+  image: qunl-rpa-gateway:0.3.0
+  init: true
+  restart: unless-stopped
+  read_only: true
+  user: "10001:10001"
+  cpus: 0.5
+  mem_limit: 256m
+  pids_limit: 96
+  cap_drop: [ALL]
+  security_opt: ['no-new-privileges:true']
+  tmpfs: ['/tmp:size=32m,mode=1777']
+  networks: [gateway]
+  environment: &environment
+    RPA_GATEWAY_DATABASE_URL_FILE: /run/secrets/database_url
+    RPA_GATEWAY_ADMIN_TOKEN_FILE: /run/secrets/admin_token
+    RPA_GATEWAY_BACKEND_TOKEN_FILE: /run/secrets/backend_token
+    RPA_GATEWAY_VERIFIER_TOKEN_FILE: /run/secrets/verifier_token
+    RPA_GATEWAY_REDIS_URL_FILE: /run/secrets/redis_url
+    RPA_GATEWAY_OBJECT_CONFIG_FILE: /run/secrets/object_config
+    RPA_GATEWAY_REDIS_NAMESPACE: scale-v3
+    RPA_GATEWAY_MEDIA_PROXY: "0"
+    RPA_GATEWAY_MEDIA_DAYS: "30"
+    RPA_GATEWAY_EVENT_DAYS: "365"
+  secrets: [database_url,admin_token,backend_token,verifier_token,redis_url,object_config]
+  logging:
+    driver: json-file
+    options: { max-size: '5m', max-file: '3' }
+  healthcheck:
+    test: ['CMD','python','-c',"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=3)"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+services:
+  gateway-a:
+    <<: *runtime
+    environment:
+      <<: *environment
+      RPA_GATEWAY_INSTANCE_ID: gateway-a
+  gateway-b:
+    <<: *runtime
+    environment:
+      <<: *environment
+      RPA_GATEWAY_INSTANCE_ID: gateway-b
+  media:
+    <<: *runtime
+    command: ['uvicorn','rpa_gateway.app:create_media_app','--factory','--host','0.0.0.0','--port','8080','--no-access-log','--limit-concurrency','8']
+    environment:
+      <<: *environment
+      RPA_GATEWAY_INSTANCE_ID: media
+    mem_limit: 256m
+  worker:
+    <<: *runtime
+    command: ['python','-m','rpa_gateway.worker']
+    mem_limit: 256m
+    healthcheck:
+      test: ['CMD','python','-c',"import os,time,psycopg;from pathlib import Path;c=psycopg.connect(Path(os.environ['RPA_GATEWAY_DATABASE_URL_FILE']).read_text().strip(),connect_timeout=3,options='-c statement_timeout=3000',application_name='rpa-gateway-healthcheck');r=c.execute(\"SELECT updated FROM worker_health WHERE name='maintenance'\").fetchone();c.close();assert r and time.time()-r[0]<60"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  redis:
+    image: redis:7.4-alpine
+    user: '10001:10001'
+    restart: unless-stopped
+    command: ['redis-server','/run/secrets/redis_conf']
+    read_only: true
+    mem_limit: 64m
+    cpus: 0.2
+    networks: [gateway]
+    secrets: [redis_conf]
+    tmpfs: ['/data:size=16m']
+    cap_drop: [ALL]
+    security_opt: ['no-new-privileges:true']
+  objects:
+    image: chrislusf/seaweedfs:4.51
+    working_dir: /data
+    user: "10001:10001"
+    restart: unless-stopped
+    command: ['server','-dir=/data','-ip=objects','-ip.bind=0.0.0.0','-master.volumeSizeLimitMB=64','-volume.max=8','-s3','-s3.port=9000','-s3.config=/run/secrets/object_identity']
+    environment: { HOME: /tmp, GOMEMLIMIT: 180MiB }
+    secrets: [object_identity]
+    tmpfs: ['/tmp:size=16m,mode=1777']
+    volumes: ['../runtime/objects:/data']
+    networks: [gateway]
+    mem_limit: 256m
+    cpus: 0.5
+    logging:
+      driver: json-file
+      options: { max-size: '5m', max-file: '3' }
+  ingress:
+    image: nginx:1.28-alpine
+    restart: unless-stopped
+    ports: ['127.0.0.1:31080:8080','127.0.0.1:31443:8443','127.0.0.1:31444:8444']
+    volumes: ['./nginx-scale.conf:/etc/nginx/nginx.conf:ro','../runtime/tls:/run/tls:ro']
+    tmpfs: ['/tmp:size=32m','/var/cache/nginx:size=8m','/var/run:size=1m']
+    read_only: true
+    networks: [gateway]
+    mem_limit: 64m
+    cpus: 0.2
+    ulimits: { nofile: { soft: 16384, hard: 16384 } }
+    depends_on: [gateway-a,gateway-b,media,objects]
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    user: "10001:10001"
+    restart: unless-stopped
+    command: ['--config.file=/etc/prometheus/prometheus.yml','--storage.tsdb.retention.time=7d','--storage.tsdb.retention.size=256MB']
+    ports: ['127.0.0.1:31090:9090']
+    volumes: ['./prometheus.yml:/etc/prometheus/prometheus.yml:ro','./alerts.yml:/etc/prometheus/alerts.yml:ro','../runtime/prometheus:/prometheus']
+    secrets: [admin_token]
+    networks: [gateway]
+    mem_limit: 128m
+    cpus: 0.2
+secrets:
+  database_url: { file: ../runtime/secrets/database_url }
+  admin_token: { file: ../runtime/secrets/admin_token }
+  backend_token: { file: ../runtime/secrets/backend_token }
+  verifier_token: { file: ../runtime/secrets/verifier_token }
+  redis_url: { file: ../runtime/secrets/redis_url }
+  redis_conf: { file: ../runtime/secrets/redis.conf }
+  object_config: { file: ../runtime/secrets/object_config }
+  object_identity: { file: ../runtime/secrets/object_identity }
+networks:
+  gateway:
+    external: true
+    name: qunl-rpa-gateway_isolated

@@ -4,6 +4,17 @@ import io
 import json
 import logging
 import os
+import random
+import time
+import tempfile
+import uuid
+import resource
+import sys
+import shutil
+import psycopg
+from psycopg_pool import PoolTimeout
+from botocore.exceptions import BotoCoreError, ClientError
+import redis
 import warnings
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -17,6 +28,12 @@ from starlette.concurrency import run_in_threadpool
 
 from .models import Claim, Confirmation, DeviceCreate, Heartbeat, Hello, Receipt, Review, TaskCreate
 from .store import Store, fail
+from .presence import Presence
+from .objects import Objects, verify_image
+from .metrics import Metrics, HttpMetrics, CONTENT_TYPE_LATEST
+from .notifications import Hub
+from .uploads import Uploads
+from .models import UploadCreate
 
 MAX_BODY = 16 * 1024 * 1024
 MAX_MEDIA = 12 * 1024 * 1024
@@ -29,6 +46,15 @@ class Settings:
     admin_token: str = field(repr=False)
     backend_token: str = field(repr=False)
     verifier_token: str = field(repr=False)
+    redis_url: str = field(default='',repr=False)
+    redis_namespace: str = 'gateway'
+    object_config: dict = field(default_factory=dict,repr=False)
+    embedded_worker: bool = False
+    allow_media_proxy: bool = True
+    media_days: int = 30
+    event_days: int = 365
+    instance_id: str = field(default_factory=lambda:uuid.uuid4().hex)
+
 
     def __post_init__(self):
         tokens = (self.admin_token, self.backend_token, self.verifier_token)
@@ -41,7 +67,21 @@ class Settings:
             path = os.environ.get(name + '_FILE')
             return Path(path).read_text().strip() if path else os.environ.get(name, '')
         return cls(secret('RPA_GATEWAY_DATABASE_URL'),
-                   secret('RPA_GATEWAY_ADMIN_TOKEN'),secret('RPA_GATEWAY_BACKEND_TOKEN'),secret('RPA_GATEWAY_VERIFIER_TOKEN'))
+                   secret('RPA_GATEWAY_ADMIN_TOKEN'),secret('RPA_GATEWAY_BACKEND_TOKEN'),secret('RPA_GATEWAY_VERIFIER_TOKEN'),
+                   redis_url=secret('RPA_GATEWAY_REDIS_URL'),
+                   redis_namespace=os.environ.get('RPA_GATEWAY_REDIS_NAMESPACE','gateway'),
+                   object_config=json.loads(secret('RPA_GATEWAY_OBJECT_CONFIG') or '{}'),
+                   embedded_worker=os.environ.get('RPA_GATEWAY_EMBEDDED_WORKER','0')=='1',
+                   allow_media_proxy=os.environ.get('RPA_GATEWAY_MEDIA_PROXY','0')=='1',
+                   media_days=int(os.environ.get('RPA_GATEWAY_MEDIA_DAYS','30')),
+                   event_days=int(os.environ.get('RPA_GATEWAY_EVENT_DAYS','365')),
+                   instance_id=os.environ.get('RPA_GATEWAY_INSTANCE_ID',uuid.uuid4().hex))
+
+
+def make_store(settings,clock=None,pool_size=4):
+    presence=Presence(settings.redis_url,settings.redis_namespace,**({'clock':clock} if clock else {})) if settings.redis_url else None
+    objects=Objects(settings.object_config) if settings.object_config else None
+    return Store(settings.database,**({'clock':clock} if clock else {}),pool_size=pool_size,presence=presence,objects=objects)
 
 
 class BodyLimit:
@@ -52,14 +92,17 @@ class BodyLimit:
     async def __call__(self, scope, receive, send):
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
+        # Raw images are streamed and bounded by the dedicated media endpoint.
+        if scope.get('path','').endswith('/media') and scope.get('method')=='POST':
+            return await self.app(scope,receive,send)
         data = bytearray()
         while True:
             event = await receive()
             if event['type'] == 'http.disconnect':
                 return
             data.extend(event.get('body', b''))
-            if len(data) > MAX_BODY:
-                response = JSONResponse({'detail':'Request exceeds 16 MiB'},status_code=413)
+            if len(data) > 256*1024:
+                response = JSONResponse({'detail':'Control request exceeds 256 KiB'},status_code=413)
                 return await response(scope, receive, send)
             if not event.get('more_body',False):
                 break
@@ -75,35 +118,73 @@ class BodyLimit:
 
 def create_app(settings=None, clock=None):
     settings = settings or Settings.from_env()
-    store = Store(settings.database, **({'clock':clock} if clock else {}))
+    store=make_store(settings,clock)
+    metrics=Metrics()
+    hub=Hub(store,store.presence,metrics,instance_id=settings.instance_id) if store.presence else None
+    uploads=Uploads(store)
 
     @asynccontextmanager
     async def lifespan(app):
-        async def sweep_loop():
+        from .worker import Worker
+        jobs=[]
+        if hub:await hub.start(settings.redis_url)
+        if settings.embedded_worker:
+            jobs.append(asyncio.create_task(Worker(store,metrics,settings.media_days,settings.event_days).run()))
+        async def observe():
             while True:
-                await asyncio.sleep(5)
+                start=time.monotonic()
+                await asyncio.sleep(1)
+                metrics.loop_lag.set(max(0,time.monotonic()-start-1))
+                metrics.rss.set(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*(1 if sys.platform=='darwin' else 1024))
+                metrics.disk_free.set(shutil.disk_usage('/data' if Path('/data').is_dir() else '.').free)
+                try:metrics.fds.set(len(os.listdir('/proc/self/fd' if sys.platform=='linux' else '/dev/fd')))
+                except OSError:pass
+                if int(time.monotonic())%5:continue
+                def snapshot():
+                    with store.transaction() as db:
+                        return db.execute("SELECT (SELECT count(*) FROM outbox WHERE delivered_at IS NULL) pending, (SELECT min(created) FROM outbox WHERE delivered_at IS NULL) oldest, (SELECT count(*) FROM tasks WHERE state='unknown') unknown, (SELECT count(*) FROM tasks WHERE state='queued') queued, (SELECT updated FROM worker_health WHERE name='maintenance') worker, (SELECT count(*) FROM media_uploads WHERE state IN ('queued','validating')) media_pending, (SELECT min(created) FROM media_uploads WHERE state IN ('queued','validating')) media_oldest, (SELECT max(validation_seconds) FROM media_uploads WHERE state='ready' AND updated>EXTRACT(EPOCH FROM now())-300) media_seconds").fetchone()
                 try:
-                    def sweep():
-                        with store.transaction() as db:
-                            store.sweep(db)
-                    await run_in_threadpool(sweep)
-                except Exception:
-                    logging.exception('Gateway maintenance failed')
-        task = asyncio.create_task(sweep_loop())
-        try:
-            yield
+                    values=await run_in_threadpool(snapshot)
+                    metrics.outbox.set(values['pending']);metrics.outbox_age.set(max(0,store.clock()-(values['oldest'] or store.clock())))
+                    metrics.unknown.set(values['unknown']);metrics.queue.set(values['queued']);metrics.worker.set(values['worker'] or 0)
+                    metrics.pool_wait.set(store.database.pool.get_stats().get('requests_waiting',0))
+                    metrics.media_pending.set(values['media_pending']);metrics.media_oldest.set(max(0,store.clock()-(values['media_oldest'] or store.clock())))
+                    metrics.media_seconds.set(values['media_seconds'] or 0)
+                    if store.objects:
+                        try:metrics.objects_up.set(1 if await run_in_threadpool(store.objects.ready) else 0)
+                        except Exception:metrics.objects_up.set(0)
+                    if store.presence:metrics.redis_up.set(1 if await run_in_threadpool(store.presence.ping) else 0)
+                except asyncio.CancelledError:raise
+                except Exception:metrics.redis_up.set(0)
+        jobs.append(asyncio.create_task(observe()))
+        try:yield
         finally:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for job in jobs:job.cancel()
+            await asyncio.gather(*jobs,return_exceptions=True)
+            if hub:await hub.close()
+            if store.presence:await run_in_threadpool(store.presence.close)
             await run_in_threadpool(store.close)
 
-    app = FastAPI(title='QUNL RPA Gateway',version='0.2.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
+    app = FastAPI(title='QUNL RPA Gateway',version='0.3.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
     app.add_middleware(BodyLimit)
+    app.add_middleware(HttpMetrics,metrics=metrics)
     app.state.store=store
+    app.state.metrics=metrics
+    app.state.hub=hub
+    http_slots=asyncio.Semaphore(64)
+    @app.middleware("http")
+    async def bounded_http(request,call_next):
+        try:await asyncio.wait_for(http_slots.acquire(),timeout=.1)
+        except TimeoutError:return JSONResponse({"detail":"Gateway busy"},status_code=503,headers={"Retry-After":"1"})
+        try:return await call_next(request)
+        finally:http_slots.release()
     decode_slot=asyncio.Semaphore(1)
+
+    async def dependency_failure(request,exc):
+        logging.warning('Gateway dependency unavailable: %s',type(exc).__name__)
+        return JSONResponse({'detail':'Gateway dependency unavailable; reconcile before retrying a submit'},status_code=503,headers={'Retry-After':'2'})
+    for exception in (psycopg.OperationalError,PoolTimeout,redis.RedisError,BotoCoreError,ClientError):
+        app.add_exception_handler(exception,dependency_failure)
 
     @app.exception_handler(Exception)
     async def unexpected(request, exc):
@@ -132,7 +213,19 @@ def create_app(settings=None, clock=None):
     verifier=role(settings.verifier_token)
 
     def device(value=Depends(token)):
-        return store.device(value)
+        current=store.device(value)
+        if store.presence:
+            try:
+                store.presence.check_rate('device',current['id'],10,30)
+                store.presence.check_rate('tenant',current['tenant'],500,1000)
+            except redis.RedisError:pass  # Receipts still reach PostgreSQL; send readiness separately fails closed.
+        return current
+
+    def backend_rate(tenant):
+        if store.presence:
+            try:store.presence.check_rate('backend',tenant,50,100)
+            except redis.RedisError:fail(503,'Admission unavailable; retry with the same idempotency key')
+
 
     def tenant_id(tenant):
         import re
@@ -144,8 +237,20 @@ def create_app(settings=None, clock=None):
     def health():
         with store.transaction() as db:
             db.execute('SELECT 1').fetchone()
-        return {'service':'rpa-gateway','version':'0.2.0','mode':'isolated_opt_in','ready':True,
-                'legacy_connected':False,'storage':'postgresql'}
+        return {'service':'rpa-gateway','version':'0.3.0','mode':'isolated_opt_in','ready':True,
+                'legacy_connected':False,'storage':'postgresql','instance':settings.instance_id}
+
+    @app.get('/metrics',dependencies=[Depends(admin)])
+    def metric_endpoint():return Response(metrics.render(),media_type=CONTENT_TYPE_LATEST)
+
+    @app.get('/v1/admin/infrastructure',dependencies=[Depends(admin)])
+    def infrastructure():
+        def probe(fn):
+            try:return bool(fn())
+            except Exception:return False
+        return {'redis':probe(store.presence.ping) if store.presence else False,
+                'objects':probe(store.objects.ready) if store.objects else False,
+                'pool':store.database.pool.get_stats(),'instance':settings.instance_id}
 
     @app.get('/openapi.json',dependencies=[Depends(admin)])
     def schema():
@@ -177,30 +282,43 @@ def create_app(settings=None, clock=None):
 
     @app.post('/v1/backend/{tenant}/media',dependencies=[Depends(backend)])
     async def upload(tenant:str,request:Request):
+        if not settings.allow_media_proxy:fail(409,'Use direct upload authorization or the dedicated media ingress')
         tenant=tenant_id(tenant)
-        data=await request.body()
-        if not data or len(data)>MAX_MEDIA:
-            fail(413,'Media must be 1 byte to 12 MiB')
-        def decode():
-            try:
-                with warnings.catch_warnings():
-                    warnings.simplefilter('error',Image.DecompressionBombWarning)
-                    with Image.open(io.BytesIO(data)) as image:
-                        kind=image.format
-                        if kind not in ('PNG','JPEG'):
-                            fail(415,'Only original PNG and JPEG are supported')
-                        image.verify()
-                    # Force full decoding to reject truncated or corrupt images.
-                    with Image.open(io.BytesIO(data)) as image:
-                        image.load()
-            except (UnidentifiedImageError,OSError,ValueError,SyntaxError,Image.DecompressionBombError,Image.DecompressionBombWarning):
-                fail(415,'Invalid, truncated or excessive image')
-            return store.put_media(tenant,data,{'PNG':'image/png','JPEG':'image/jpeg'}[kind])
-        async with decode_slot:
-            return await run_in_threadpool(decode)
+        backend_rate(tenant)
+        try:await asyncio.wait_for(decode_slot.acquire(),timeout=.1)
+        except TimeoutError:fail(503,'Media validation busy; retry with the same original')
+        try:
+            # One compatibility ingress at a time per media process; direct S3 uploads bypass this path.
+            with tempfile.SpooledTemporaryFile(max_size=1024*1024) as stream:
+                size=0
+                async for chunk in request.stream():
+                    size+=len(chunk)
+                    if size>MAX_MEDIA:fail(413,'Original exceeds 12 MiB')
+                    stream.write(chunk)
+                if not size:fail(413,'Empty image')
+                stream.seek(0)
+                try:return await run_in_threadpool(store.put_media,tenant,stream.read(),request.headers.get('content-type',''))
+                except ValueError:fail(415,'Invalid, truncated or excessive image')
+        finally:decode_slot.release()
+
+    @app.post('/v1/backend/{tenant}/media/uploads',dependencies=[Depends(backend)])
+    def create_upload(tenant:str,body:UploadCreate):
+        backend_rate(tenant)
+        return uploads.create(tenant_id(tenant),body)
+
+    @app.post('/v1/backend/{tenant}/media/uploads/{upload_id}/complete',dependencies=[Depends(backend)])
+    def complete_upload(tenant:str,upload_id:str):
+        backend_rate(tenant)
+        return uploads.complete(tenant_id(tenant),upload_id)
+
+    @app.get('/v1/backend/{tenant}/media/uploads/{upload_id}',dependencies=[Depends(backend)])
+    def upload_status(tenant:str,upload_id:str):
+        backend_rate(tenant)
+        return uploads.status(tenant_id(tenant),upload_id)
 
     @app.post('/v1/backend/{tenant}/tasks',dependencies=[Depends(backend)])
     def task(tenant:str,body:TaskCreate):
+        backend_rate(tenant)
         return store.create_task(tenant_id(tenant),body)
 
     @app.post('/v1/verifier/{tenant}/tasks/{task_id}/confirm',dependencies=[Depends(verifier)])
@@ -229,12 +347,21 @@ def create_app(settings=None, clock=None):
             return {'tasks':[store.present(row,device_view=True,db=db) for row in rows],
                     'instruction':'Resume only leased tasks after renewing; reconcile submitting/submitted/unknown without resending'}
 
+    @app.get('/v1/device/sync')
+    def sync(session_id:str,current=Depends(device)):
+        return store.snapshot(current,session_id)
+
+    @app.get('/v1/device/tasks/{task_id}/media/{media_id}/download')
+    def download_link(task_id:str,media_id:str,current=Depends(device)):
+        return store.download_link(current,task_id,media_id)
+
     @app.post('/v1/device/tasks/{task_id}/receipts')
     def receipt(task_id:str,body:Receipt,current=Depends(device)):
         return store.receipt(current,task_id,body)
 
     @app.get('/v1/device/tasks/{task_id}/media/{media_id}')
     def media(task_id:str,media_id:str,current=Depends(device)):
+        if not settings.allow_media_proxy:fail(409,'Use the signed original download endpoint')
         row=store.media_for_device(current,task_id,media_id)
         return Response(row['data'],media_type=row['mime'],headers={
             'ETag':'"'+row['sha256']+'"','X-Content-SHA256':row['sha256'],
@@ -242,36 +369,55 @@ def create_app(settings=None, clock=None):
 
     @app.websocket('/v1/device/notifications')
     async def notifications(ws:WebSocket):
-        # Tokens never appear in URL/query strings, browser history or access logs.
         await ws.accept()
+        slot=None
         try:
             initial=await asyncio.wait_for(ws.receive_text(),timeout=5)
-            if len(initial)>1024:
-                return await ws.close(code=1008)
+            if len(initial)>1024:return await ws.close(code=1008)
             auth=json.loads(initial)
             current=await run_in_threadpool(store.device,auth['token'])
             sid=auth['session_id']
-            previous=None
-            while True:
-                def snapshot():
-                    with store.transaction() as db:
-                        store.session(db,current,sid)
-                        rows=db.execute('SELECT id,state,updated FROM tasks WHERE tenant=%s AND device=%s ORDER BY created DESC LIMIT 100',
-                                        (current['tenant'],current['id'])).fetchall()
-                        return [dict(row) for row in rows]
-                state=await run_in_threadpool(snapshot)
-                if state!=previous:
-                    await ws.send_json({'type':'tasks_changed','tasks':state,'claim_via':'HTTPS'})
-                    previous=state
-                try:
-                    ping=await asyncio.wait_for(ws.receive_text(),timeout=1)
-                    if ping!='ping':
-                        return await ws.close(code=1008)
-                    await ws.send_json({'type':'pong'})
-                except TimeoutError:
-                    pass
-        except (HTTPException,KeyError,ValueError,TypeError,TimeoutError):
-            await ws.close(code=1008)
-        except WebSocketDisconnect:
-            pass
+            await run_in_threadpool(store.snapshot,current,sid) # SQL validates even cached credentials.
+            if not hub:return await ws.close(code=1013,reason='Notification service not configured; use sync')
+            slot,connection=await hub.add(current,sid)
+            async def sender():
+                previous=None
+                while True:
+                    await connection.queue.get()
+                    if connection.invalid:return await ws.close(code=1008)
+                    try:state=await run_in_threadpool(store.snapshot,current,sid)
+                    except HTTPException:return await ws.close(code=1008)
+                    connection.revision=state['cursor']
+                    if state!=previous:
+                        await asyncio.wait_for(ws.send_json(state),timeout=5)
+                        previous=state
+            async def receiver():
+                while True:
+                    ping=await asyncio.wait_for(ws.receive_text(),timeout=75)
+                    if ping!='ping':return await ws.close(code=1008)
+                    try:
+                        if not await run_in_threadpool(store.presence.renew_connection,current,slot):return await ws.close(code=1013)
+                    except redis.RedisError:return await ws.close(code=1013)
+                    await asyncio.wait_for(ws.send_json({'type':'pong'}),timeout=5)
+            jobs=[asyncio.create_task(sender()),asyncio.create_task(receiver())]
+            try:
+                done,pending=await asyncio.wait(jobs,return_when=asyncio.FIRST_COMPLETED)
+                for job in done:job.result()
+            finally:
+                for job in jobs:job.cancel()
+                await asyncio.gather(*jobs,return_exceptions=True)
+        except (HTTPException,KeyError,ValueError,TypeError):
+            try:await ws.close(code=1008)
+            except Exception:pass
+        except (RuntimeError,TimeoutError):
+            try:await ws.close(code=1013)
+            except Exception:pass
+        except WebSocketDisconnect:pass
+        finally:
+            if slot:await hub.remove(slot)
     return app
+
+
+def create_media_app():
+    from dataclasses import replace
+    return create_app(replace(Settings.from_env(),allow_media_proxy=True))

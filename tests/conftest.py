@@ -1,6 +1,7 @@
 import io
 import os
 import uuid
+import json
 from pathlib import Path
 import psycopg
 from psycopg import sql
@@ -34,7 +35,10 @@ def database_dsn():
 @pytest.fixture
 def env(database_dsn):
     clock=Clock()
-    settings=Settings(database_dsn,'a'*48,'b'*48,'v'*48)
+    objects=json.loads(Path(os.environ.get('RPA_GATEWAY_TEST_OBJECT_CONFIG','runtime/scale-local/objects.json')).read_text())
+    objects['prefix']='tests/'+uuid.uuid4().hex
+    settings=Settings(database_dsn,'a'*48,'b'*48,'v'*48,redis_url=os.environ.get('RPA_GATEWAY_TEST_REDIS_URL','redis://127.0.0.1:36379/0'),
+        redis_namespace='test_'+uuid.uuid4().hex,object_config=objects,embedded_worker=True,allow_media_proxy=True)
     app=create_app(settings,clock)
     with TestClient(app) as client:
         yield Harness(client,settings,clock,app)

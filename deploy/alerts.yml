@@ -1,0 +1,58 @@
+groups:
+  - name: rpa-gateway
+    rules:
+      - alert: RPAGatewayDown
+        expr: up{job="rpa-gateway"} == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "RPA 网关实例不可用" }
+      - alert: RPAGatewayRedisUnavailable
+        expr: rpa_gateway_redis_up == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "在线状态不可用，新的发送任务暂停派发" }
+      - alert: RPAOutboxLag
+        expr: rpa_gateway_outbox_oldest_seconds > 10
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "任务通知积压超过 10 秒" }
+      - alert: RPAUnknownDelivery
+        expr: rpa_gateway_unknown_tasks > 0
+        for: 2m
+        labels: { severity: warning }
+        annotations: { summary: "有任务等待送达核对，禁止自动重发" }
+      - alert: RPAGatewayLatency
+        expr: histogram_quantile(0.95, sum by (le) (rate(rpa_gateway_http_seconds_bucket[5m]))) > 0.5
+        for: 5m
+        labels: { severity: warning }
+        annotations: { summary: "网关 HTTP P95 耗时超过 500 毫秒" }
+      - alert: RPAGatewayLoopLag
+        expr: rpa_gateway_event_loop_lag_seconds > 0.2
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "异步事件循环出现持续阻塞" }
+      - alert: RPAGatewayErrors
+        expr: sum(rate(rpa_gateway_http_total{status=~"5.."}[5m])) / clamp_min(sum(rate(rpa_gateway_http_total[5m])), 0.001) > 0.01
+        for: 2m
+        labels: { severity: critical }
+        annotations: { summary: "网关服务错误率超过百分之一" }
+      - alert: RPAWorkerStale
+        expr: time() - rpa_gateway_worker_last_success_timestamp > 60
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "网关后台任务停止推进" }
+      - alert: RPAGatewayDiskSpace
+        expr: rpa_gateway_runtime_disk_free_bytes < 5 * 1024 * 1024 * 1024
+        for: 5m
+        labels: { severity: critical }
+        annotations: { summary: "网关运行盘剩余空间低于 5 GiB" }
+      - alert: RPAObjectsUnavailable
+        expr: rpa_gateway_objects_up == 0
+        for: 1m
+        labels: { severity: critical }
+        annotations: { summary: "原图对象存储不可用" }
+      - alert: RPAMediaValidationBacklog
+        expr: rpa_gateway_media_oldest_seconds > 60
+        for: 1m
+        labels: { severity: warning }
+        annotations: { summary: "原图校验队列等待超过 60 秒" }

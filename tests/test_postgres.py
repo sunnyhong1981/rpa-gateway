@@ -20,7 +20,7 @@ def test_two_independent_pools_cannot_claim_same_device_twice(env):
     d=env.register()
     env.enqueue(d);env.enqueue(d)
     a=env.app.state.store
-    b=Store(env.settings.database,clock=env.clock,pool_size=4)
+    b=Store(env.settings.database,clock=env.clock,pool_size=4,presence=a.presence,objects=a.objects)
     try:
         credential=a.device(d['headers']['Authorization'][7:])
         def claim(index):return (a if index%2 else b).claim(credential,Claim(session_id=d['session_id']))
@@ -74,7 +74,10 @@ def test_concurrent_duplicate_task_creation_stays_idempotent(env):
 
 def test_database_unique_constraint_prevents_second_active_task(env):
     d=env.register();env.enqueue(d);second=env.enqueue(d).json()
-    env.claim(d)
+    claimed=env.claim(d).json()['task']
+    if claimed['id']==second['id']:
+        with env.app.state.store.transaction() as db:
+            second=db.execute("SELECT id FROM tasks WHERE state='queued' LIMIT 1").fetchone()
     with pytest.raises(psycopg.errors.UniqueViolation):
         with env.app.state.store.transaction() as db:
             db.execute("UPDATE tasks SET state='leased' WHERE id=%s",(second['id'],))

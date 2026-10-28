@@ -94,3 +94,21 @@ WebSocket 建连后 5 秒内，首帧 JSON 为 `token` 和 `session_id`。服务
 - 422：协议字段或存档证据不符合要求。
 
 SDK 在 `rpa_gateway/client.py`，只提供传输，不带桌面监听和发送代码，不能直接替换现有正式 RPA。SDK 不自动重试提交，UI 适配器必须持久记录本地提交边界。
+
+## v0.3.0 新增接口
+
+| 角色 | 接口 | 用途 |
+| --- | --- | --- |
+| admin | GET `/metrics` | Prometheus 指标，route 模板标签不含设备/运单信息 |
+| admin | GET `/v1/admin/infrastructure` | Redis、对象存储和连接池状态，不含密钥 |
+| backend | POST `/v1/backend/{tenant}/media/uploads` | body 为 `{sha256,md5,size}`，取得 5 分钟的指定 staging 对象上传授权 |
+| backend | POST `/v1/backend/{tenant}/media/uploads/{id}/complete` | 通知后台开始验证，只排队，不直接允许派发 |
+| backend | GET `/v1/backend/{tenant}/media/uploads/{id}` | 查询 pending/queued/validating/ready/rejected；ready 才返回可引用的 media_id |
+| device | GET `/v1/device/sync?session_id=...` | 全量同步当前活动任务和单调递增设备 revision，不重新领取 |
+| device | GET `/v1/device/tasks/{task}/media/{media}/download` | 确认当前任务归属后返回 120 秒对象下载授权，SDK 不转发设备 bearer |
+
+旧原图上传/下载接口保留，由 Nginx 送到独立媒体服务；控制网关拒绝直接处理这些原图。媒体格式、哈希、大小仍验证，签名链接过期后需重新向网关鉴权。撤销设备不能立即撤销已签出且未到期的 URL；要求立即撤销时使用独立媒体鉴权代理。
+
+v0.3.0 通知包括 `cursor`（设备 revision）。客户端可以始终先 sync，推送只作同步提示；同一设备最多两个跨实例通知连接。SDK `notifications()` 带随机退避和低频同步，不自动领取或发送；可传 `ca_file` 指定信任试运行证书，禁止关闭证书验证。
+
+限流返回 429 与 Retry-After；Redis 就绪状态不可用时，新派发/新提交返回 503，已有提交回执和官方核验仍可写 PostgreSQL。依赖失败不会自动退回本地数据库或自动重放任务。

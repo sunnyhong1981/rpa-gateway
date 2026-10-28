@@ -3,6 +3,7 @@ import json
 import secrets
 import time
 import uuid
+import redis
 from collections import Counter
 from contextlib import contextmanager
 from fastapi import HTTPException
@@ -21,8 +22,10 @@ def digest(token):
 
 
 class Store:
-    def __init__(self, dsn, clock=time.time, pool_size=8):
+    def __init__(self, dsn, clock=time.time, pool_size=8, presence=None, objects=None):
         self.clock = clock
+        self.presence = presence
+        self.objects = objects
         self.database = Database(dsn, pool_size=pool_size)
         self.database.initialize()
 
@@ -41,10 +44,17 @@ class Store:
             fail(404, 'Device not found')
         return row
 
+    def notify(self, db, tenant, device, kind='tasks_changed'):
+        owner=db.execute('UPDATE devices SET revision=revision+1 WHERE tenant=%s AND id=%s RETURNING revision',
+                         (tenant,device)).fetchone()
+        db.execute('INSERT INTO outbox(tenant,device,revision,kind,created) VALUES(%s,%s,%s,%s,%s)',
+                   (tenant,device,owner['revision'],kind,self.clock()))
+
     def event(self, db, task, state, event_id=None, details=None):
         db.execute('INSERT INTO events(tenant,task,event_id,at,state,details) VALUES(%s,%s,%s,%s,%s,%s)',
                    (task['tenant'], task['id'], event_id or uuid.uuid4().hex,
                     self.clock(), state, json.dumps(details or {}, sort_keys=True)))
+        self.notify(db,task['tenant'],task['device'])
 
     def transition(self, db, task, state, details=None):
         db.execute('UPDATE tasks SET state=%s,updated=%s WHERE id=%s', (state, self.clock(), task['id']))
@@ -74,11 +84,20 @@ class Store:
                     self.transition(db, task, 'unknown', {'reason':'archive_or_submission_timeout_no_retry'})
 
     def device(self, token):
+        token_hash=digest(token)
+        if self.presence:
+            try:
+                cached=self.presence.cached_device(token_hash)
+                if cached:return cached
+            except redis.RedisError:pass
         with self.transaction() as db:
-            row = db.execute('SELECT * FROM devices WHERE token_hash=%s AND revoked=0', (digest(token),)).fetchone()
-            if row is None:
-                fail(401, 'Invalid device credential')
-            return dict(row)
+            row=db.execute('SELECT * FROM devices WHERE token_hash=%s AND revoked=0',(token_hash,)).fetchone()
+            if row is None:fail(401,'Invalid device credential')
+            result=dict(row)
+        if self.presence:
+            try:self.presence.cache_device(result)
+            except redis.RedisError:pass
+        return result
 
     def provision(self, tenant, body):
         token = secrets.token_urlsafe(36)
@@ -98,6 +117,10 @@ class Store:
                 fail(404, 'Device not found')
             db.execute('UPDATE devices SET token_hash=%s,revoked=%s,session=NULL,seen=NULL WHERE tenant=%s AND id=%s',
                        (digest(token), 0 if rotate else 1, tenant, device_id))
+            self.notify(db,tenant,device_id,'credential_changed')
+            if self.presence:
+                try:self.presence.invalidate(row)
+                except redis.RedisError:pass
         return {'device_id': device_id, **({'token': token} if rotate else {'revoked': True})}
 
     def current_device(self, db, device, lock=False):
@@ -112,10 +135,14 @@ class Store:
         if row['session'] != session_id:
             fail(409, 'Session superseded; handshake required')
         if ready:
-            status = json.loads(row['heartbeat'] or '{}')
-            if row['seen'] is None or self.clock() - row['seen'] > 45 or not all(
-                    status.get(k) is True for k in ('worker_alive','desktop_unlocked','wecom_logged_in','auto_send')):
-                fail(409, 'Device not ready or heartbeat stale')
+            if self.presence:
+                try:is_ready=self.presence.ready(row)
+                except redis.RedisError:fail(503,'Online state unavailable; new sends paused')
+            else:
+                status=json.loads(row['heartbeat'] or '{}')
+                is_ready=row['seen'] is not None and self.clock()-row['seen']<=45 and all(
+                    status.get(k) is True for k in ('worker_alive','desktop_unlocked','wecom_logged_in','auto_send'))
+            if not is_ready:fail(409,'Device not ready or heartbeat stale')
         return row
 
     def hello(self, device, body):
@@ -134,22 +161,44 @@ class Store:
             sid = uuid.uuid4().hex
             db.execute('UPDATE devices SET session=%s,installation=%s,hello=%s,heartbeat=NULL,seen=NULL WHERE tenant=%s AND id=%s',
                        (sid, body.installation_id, json.dumps(body.model_dump()),row['tenant'],row['id']))
+            self.notify(db,row['tenant'],row['id'],'session_changed')
+            if self.presence:
+                try:self.presence.invalidate(row)
+                except redis.RedisError:pass
             return {'session_id': sid, 'protocol': 1, 'heartbeat_seconds': 15}
 
     def heartbeat(self, device, body):
+        if self.presence:
+            if device['session']!=body.session_id:fail(409,'Session superseded; handshake required')
+            try:self.presence.beat(device,body)
+            except redis.RedisError:fail(503,'Online state unavailable; new sends paused')
+            return {'accepted':True}
         with self.transaction() as db:
-            self.session(db, device, body.session_id, lock=True)
+            self.session(db,device,body.session_id,lock=True)
             db.execute('UPDATE devices SET heartbeat=%s,seen=%s WHERE tenant=%s AND id=%s',
-                       (json.dumps(body.model_dump()), self.clock(),device['tenant'],device['id']))
-        return {'accepted': True}
+                       (json.dumps(body.model_dump()),self.clock(),device['tenant'],device['id']))
+        return {'accepted':True}
 
-    def put_media(self, tenant, data, mime):
-        sha = hashlib.sha256(data).hexdigest()
-        with self.transaction() as db:
-            db.execute('INSERT INTO media(tenant,id,sha256,md5,size,mime,data) VALUES(%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant,sha256) DO NOTHING',
-                       (tenant,uuid.uuid4().hex,sha,hashlib.md5(data).hexdigest(),len(data),mime,data))
-            row = db.execute('SELECT * FROM media WHERE tenant=%s AND sha256=%s', (tenant,sha)).fetchone()
-            return {key:row[key] for key in ('id','sha256','md5','size','mime')}
+    def put_media(self, tenant, data, mime, _verified=None):
+        from .objects import verify_image
+        meta=_verified or verify_image(data)
+        sha=meta['sha256']
+        object_key=None
+        if self.objects:
+            object_key=self.objects.key(tenant,sha)+'-'+uuid.uuid4().hex
+            self.objects.put(object_key,data,meta['mime'])
+        try:
+            with self.transaction() as db:
+                inserted=db.execute('INSERT INTO media(tenant,id,sha256,md5,size,mime,data,object_key,created) VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT(tenant,sha256) DO NOTHING RETURNING id',
+                    (tenant,uuid.uuid4().hex,sha,meta['md5'],meta['size'],meta['mime'],None if self.objects else data,object_key,self.clock())).fetchone()
+                row=db.execute('SELECT id,sha256,md5,size,mime FROM media WHERE tenant=%s AND sha256=%s',(tenant,sha)).fetchone()
+                if object_key and inserted is None:
+                    db.execute('INSERT INTO media_gc(object_key,created) VALUES(%s,%s) ON CONFLICT DO NOTHING',(object_key,self.clock()))
+                return dict(row)
+        except Exception:
+            # Commit acknowledgement can be lost after commit. Never delete here:
+            # delayed orphan reconciliation checks the database before any object deletion.
+            raise
 
     def create_task(self, tenant, body):
         payload = body.model_dump()
@@ -173,7 +222,7 @@ class Store:
                 fail(403, 'Inbox or room outside device scope')
             total = 0
             for media_id in body.media_ids:
-                row = db.execute('SELECT size FROM media WHERE tenant=%s AND id=%s',(tenant,media_id)).fetchone()
+                row = db.execute('SELECT size FROM media WHERE tenant=%s AND id=%s AND deleting=false FOR SHARE',(tenant,media_id)).fetchone()
                 if row is None:
                     fail(422, 'Media missing in this tenant')
                 total += row['size']
@@ -277,14 +326,34 @@ class Store:
             self.event(db,updated,updated['state'],body.event_id,receipt_body)
             return {'state':updated['state'],'duplicate':False}
 
-    def media_for_device(self, device, task_id, media_id):
+    def media_for_device(self, device, task_id, media_id, include_bytes=True):
         with self.transaction() as db:
-            task = self.owned_task(db,device,task_id)
-            if media_id not in json.loads(task['payload'])['media_ids']:
-                fail(404,'Media not in task')
-            if task['state'] not in ('leased','submitting','submitted','unknown'):
-                fail(409,'Task not active')
-            return dict(db.execute('SELECT * FROM media WHERE tenant=%s AND id=%s',(device['tenant'],media_id)).fetchone())
+            task=self.owned_task(db,device,task_id)
+            if media_id not in json.loads(task['payload'])['media_ids']:fail(404,'Media not in task')
+            if task['state'] not in ACTIVE:fail(409,'Task not active')
+            row=db.execute('SELECT * FROM media WHERE tenant=%s AND id=%s AND deleting=false',
+                           (device['tenant'],media_id)).fetchone()
+            if row is None:fail(410,'Original media has expired')
+            result=dict(row)
+        if include_bytes and result['data'] is None:
+            if not self.objects:fail(503,'Object storage not configured')
+            result['data']=self.objects.get(result['object_key'])
+            if hashlib.sha256(result['data']).hexdigest()!=result['sha256'] or len(result['data'])!=result['size']:
+                fail(502,'Original object integrity mismatch')
+        return result
+
+    def download_link(self, device, task_id, media_id):
+        row=self.media_for_device(device,task_id,media_id,include_bytes=False)
+        if not row['object_key'] or not self.objects:fail(409,'Object migration pending; use authenticated media endpoint')
+        return {'url':self.objects.download(row['object_key']), 'expires_in':120,
+                **{k:row[k] for k in ('id','sha256','md5','size','mime')}}
+
+    def snapshot(self,device,session_id):
+        with self.transaction() as db:
+            row=self.session(db,device,session_id)
+            tasks=[dict(t) for t in db.execute("SELECT id,state,updated FROM tasks WHERE tenant=%s AND device=%s AND state IN ('queued','leased','submitting','submitted','unknown') ORDER BY created,id LIMIT 100",
+                                              (device['tenant'],device['id']))]
+            return {'type':'tasks_changed','tasks':tasks,'cursor':row['revision'],'claim_via':'HTTPS'}
 
     def lookup_task(self, db, tenant, task_id, sweep=False):
         task = db.execute('SELECT * FROM tasks WHERE tenant=%s AND id=%s',(tenant,task_id)).fetchone()
@@ -360,7 +429,6 @@ class Store:
 
     def status(self, tenant):
         with self.transaction() as db:
-            self.sweep(db)
             counts={r['state']:r['n'] for r in db.execute('SELECT state,COUNT(*) n FROM tasks WHERE tenant=%s GROUP BY state',(tenant,))}
             devices=[]
             for row in db.execute('SELECT * FROM devices WHERE tenant=%s',(tenant,)):
@@ -368,4 +436,9 @@ class Store:
                                 'stale':row['seen'] is None or self.clock()-row['seen']>45,
                                 'health':json.loads(row['heartbeat'] or '{}'),
                                 'hello':json.loads(row['hello'] or '{}')})
+                if self.presence:
+                    try:
+                        health=self.presence.health(row)
+                        devices[-1].update(health={k:v for k,v in health.items() if k not in ('token_hash','session')},seen=health.get('seen'),stale=not health or self.clock()-health.get('seen',0)>45)
+                    except redis.RedisError:devices[-1].update(health={},stale=True)
             return {'mode':'isolated_opt_in','tasks':counts,'devices':devices}

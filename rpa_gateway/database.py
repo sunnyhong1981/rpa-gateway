@@ -5,7 +5,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 TABLES = ('devices','media','tasks','events','archive_claims')
 DDL = '''
 CREATE TABLE IF NOT EXISTS gateway_schema (version INTEGER PRIMARY KEY);
@@ -42,6 +42,36 @@ CREATE TABLE IF NOT EXISTS archive_claims (
 CREATE TABLE IF NOT EXISTS gateway_imports (
  source_sha256 TEXT PRIMARY KEY, imported_at TIMESTAMPTZ NOT NULL DEFAULT now(), summary TEXT NOT NULL);
 '''
+UPGRADE = '''
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE media ALTER COLUMN data DROP NOT NULL;
+ALTER TABLE media ADD COLUMN IF NOT EXISTS object_key TEXT;
+ALTER TABLE media ADD COLUMN IF NOT EXISTS created DOUBLE PRECISION NOT NULL DEFAULT EXTRACT(EPOCH FROM now());
+ALTER TABLE media ADD COLUMN IF NOT EXISTS deleting BOOLEAN NOT NULL DEFAULT false;
+CREATE TABLE IF NOT EXISTS outbox (
+ id BIGSERIAL PRIMARY KEY, tenant TEXT NOT NULL, device TEXT NOT NULL, revision BIGINT NOT NULL,
+ kind TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, delivered_at DOUBLE PRECISION);
+CREATE INDEX IF NOT EXISTS outbox_pending ON outbox(id) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS outbox_pending_age ON outbox(created) WHERE delivered_at IS NULL;
+CREATE INDEX IF NOT EXISTS tasks_alert_states ON tasks(state) WHERE state IN ('queued','unknown');
+CREATE INDEX IF NOT EXISTS tasks_media_references ON tasks USING gin ((payload::jsonb->'media_ids'));
+CREATE TABLE IF NOT EXISTS media_uploads (
+ tenant TEXT NOT NULL, id TEXT PRIMARY KEY, staging_key TEXT NOT NULL UNIQUE,
+ expected_sha256 TEXT NOT NULL, expected_md5 TEXT NOT NULL, expected_size BIGINT NOT NULL,
+ state TEXT NOT NULL, created DOUBLE PRECISION NOT NULL, updated DOUBLE PRECISION NOT NULL,
+ media_id TEXT, reason TEXT NOT NULL DEFAULT '', lease_until DOUBLE PRECISION, attempts INTEGER NOT NULL DEFAULT 0);
+ALTER TABLE media_uploads ADD COLUMN IF NOT EXISTS validation_seconds DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS media_uploads_ready ON media_uploads(updated) WHERE state='ready';
+CREATE INDEX IF NOT EXISTS media_uploads_pending ON media_uploads(state,updated);
+CREATE TABLE IF NOT EXISTS worker_health (
+ name TEXT PRIMARY KEY, updated DOUBLE PRECISION NOT NULL, error_type TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS retention_audit (
+ id BIGSERIAL PRIMARY KEY, at DOUBLE PRECISION NOT NULL, kind TEXT NOT NULL,
+ affected BIGINT NOT NULL, details TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS maintenance_cursors (name TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS media_gc (
+ object_key TEXT PRIMARY KEY, created DOUBLE PRECISION NOT NULL);
+'''
 
 
 class Database:
@@ -58,7 +88,7 @@ class Database:
             conn.execute("SET idle_in_transaction_session_timeout='10s'")
         self.pool = ConnectionPool(make_conninfo(dsn,connect_timeout=5,application_name='qunl-rpa-gateway'),
             min_size=1,max_size=pool_size,timeout=5,max_waiting=64,open=True,
-            configure=configure,kwargs={'autocommit':True,'row_factory':dict_row})
+            configure=configure,check=ConnectionPool.check_connection,kwargs={'autocommit':True,'row_factory':dict_row})
         self.pool.wait(timeout=10)
 
     @contextmanager
@@ -75,8 +105,11 @@ class Database:
                 if statement.strip():
                     db.execute(statement)
             versions = [row['version'] for row in db.execute('SELECT version FROM gateway_schema')]
-            if versions and versions != [SCHEMA_VERSION]:
+            if versions and versions not in ([1],[SCHEMA_VERSION]):
                 raise RuntimeError('Unsupported gateway database schema')
+            for statement in UPGRADE.split(';'):
+                if statement.strip():db.execute(statement)
+            db.execute('DELETE FROM gateway_schema WHERE version<>%s',(SCHEMA_VERSION,))
             db.execute('INSERT INTO gateway_schema(version) VALUES(%s) ON CONFLICT DO NOTHING',(SCHEMA_VERSION,))
 
     def close(self):

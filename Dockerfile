@@ -5,7 +5,7 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt && groupadd --gid 10001 gateway && useradd --uid 10001 --gid gateway gateway
 COPY rpa_gateway /app/rpa_gateway
 USER 10001:10001
-CMD ["uvicorn", "rpa_gateway.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--no-access-log", "--ws-max-size", "4096", "--limit-concurrency", "8"]
+CMD ["uvicorn", "rpa_gateway.app:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080", "--workers", "1", "--no-access-log", "--ws-max-size", "4096", "--limit-concurrency", "4096", "--backlog", "4096", "--ws-max-queue", "4", "--timeout-graceful-shutdown", "30"]
 
 FROM runtime AS tests
 USER root

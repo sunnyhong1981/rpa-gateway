@@ -65,3 +65,8 @@ class Confirmation(Model):
 class Review(Model):
     action: Literal['cancel_before_submit', 'close_unknown_without_retry']
     reason: str = Field(min_length=10, max_length=1024)
+
+class UploadCreate(Model):
+    sha256: str = Field(pattern=r'^[0-9a-f]{64}$')
+    md5: str = Field(pattern=r'^[0-9a-f]{32}$')
+    size: int = Field(ge=1,le=12*1024*1024)
