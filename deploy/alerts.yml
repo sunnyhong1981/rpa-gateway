@@ -26,6 +26,11 @@ groups:
         for: 30s
         labels: { severity: warning }
         annotations: { summary: "健康探测超过 60 秒没有完成，需检查对应组件", recovery_summary: "健康探测已恢复更新", module: "网关健康采集器" }
+      - alert: RPANotificationSubscriberUnavailable
+        expr: rpa_gateway_notification_subscriber_up == 0
+        for: 30s
+        labels: { severity: warning }
+        annotations: { summary: "任务通知订阅通道不可用，实时任务唤醒可能延迟", recovery_summary: "任务通知订阅通道已恢复", module: "Redis Pub/Sub 任务通知" }
       - alert: RPAOutboxLag
         expr: rpa_gateway_outbox_oldest_seconds > 10
         for: 1m

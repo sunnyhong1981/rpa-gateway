@@ -30,6 +30,8 @@ class Metrics:
         self.probe_errors=Counter('rpa_gateway_probe_errors_total','Health probe failures',['component','error_type'],registry=self.registry)
         self.worker=Gauge('rpa_gateway_worker_last_success_timestamp','Worker progress timestamp',registry=self.registry)
         self.notifications=Counter('rpa_gateway_notifications_total','Notification actions',['action'],registry=self.registry)
+        self.subscriber_up=Gauge('rpa_gateway_notification_subscriber_up','Redis notification subscription availability',registry=self.registry)
+        self.subscriber_errors=Counter('rpa_gateway_notification_subscriber_errors_total','Notification subscription failures',['error_type'],registry=self.registry)
 
     def render(self):return generate_latest(self.registry)
 

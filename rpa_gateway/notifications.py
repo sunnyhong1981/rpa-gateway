@@ -3,6 +3,8 @@ import asyncio
 import json
 import random
 import uuid
+import time
+import logging
 from dataclasses import dataclass,field
 import redis.asyncio as aioredis
 from starlette.concurrency import run_in_threadpool
@@ -55,7 +57,9 @@ class Hub:
             except Exception:pass
 
     async def start(self,url):
-        self.redis=aioredis.Redis.from_url(url,decode_responses=True,socket_connect_timeout=1,socket_timeout=3,
+        # Pub/Sub may legitimately be idle indefinitely. Bound commands and check
+        # liveness with PING/PONG instead of treating an idle socket as a failure.
+        self.redis=aioredis.Redis.from_url(url,decode_responses=True,socket_connect_timeout=1,socket_timeout=None,
                                           max_connections=4)
         self.jobs=[asyncio.create_task(self.subscribe()),asyncio.create_task(self.reconcile())]
 
@@ -73,18 +77,36 @@ class Hub:
         while not self.stopping:
             try:
                 async with self.redis.pubsub() as subscription:
-                    await subscription.subscribe(self.presence.channel)
+                    await asyncio.wait_for(subscription.subscribe(self.presence.channel), 3)
+                    self.metrics.subscriber_up.set(1)
+                    last_ping=time.monotonic();pending_ping=None
                     # On subscribe/reconnect always resync: Redis Pub/Sub can lose notifications.
                     for connection in self.clients.values():self.signal(connection)
-                    async for message in subscription.listen():
-                        if message['type']!='message':continue
-                        payload=json.loads(message['data'])
+                    while not self.stopping:
+                        message=await subscription.get_message(timeout=1)
+                        now=time.monotonic()
+                        if message and message['type']=='pong':
+                            pending_ping=None
+                            self.metrics.notifications.labels('subscriber_pong').inc()
+                        if pending_ping is not None and now-pending_ping>5:raise TimeoutError('Subscription PONG deadline')
+                        if now-last_ping>=15 and pending_ping is None:
+                            await asyncio.wait_for(subscription.ping(), 3)
+                            last_ping=now;pending_ping=now
+                        if not message or message['type']!='message':continue
+                        try:
+                            payload=json.loads(message['data'])
+                            if not isinstance(payload,dict) or not isinstance(payload.get('tenant'),str) or not isinstance(payload.get('device'),str):raise ValueError()
+                        except (ValueError,TypeError):
+                            self.metrics.notifications.labels('invalid_notification').inc()
+                            continue
                         for connection in tuple(self.by_device.get((payload['tenant'],payload['device']),{}).values()):
                             self.signal(connection)
             except asyncio.CancelledError:raise
-            except Exception:
+            except Exception as exc:
                 if self.stopping:break
-                self.metrics.redis_up.set(0)
+                self.metrics.subscriber_up.set(0)
+                self.metrics.subscriber_errors.labels(type(exc).__name__).inc()
+                logging.warning('Gateway notification subscriber failed component=redis_pubsub error_type=%s',type(exc).__name__)
                 await asyncio.sleep(random.uniform(.5,2))
 
     async def reconcile(self):
