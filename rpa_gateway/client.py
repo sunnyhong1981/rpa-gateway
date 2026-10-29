@@ -3,6 +3,7 @@ import hashlib
 import json
 import uuid
 import ssl
+import urllib3
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -22,19 +23,23 @@ class GatewayClient:
         self.token=token
         self.hello_body={'protocol':1,'installation_id':installation_id,'runtime_version':runtime_version,'capabilities':capabilities}
         self.session_id=None
+        self.pool=urllib3.PoolManager(num_pools=2,maxsize=4,block=True,ssl_context=self.ssl_context)
 
     def request(self,path,body=None):
-        request=Request(self.base+path,data=None if body is None else json.dumps(body).encode(),headers={
-            'Authorization':'Bearer '+self.token,'Content-Type':'application/json'},method='GET' if body is None else 'POST')
-        # Never follow a redirect carrying a credential to another host.
-        from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
-        class NoRedirect(HTTPRedirectHandler):
-            def redirect_request(self,*args,**kwargs): return None
+        # Reuse TLS connections. Never retry or redirect a POST/send fence.
         try:
-            with build_opener(NoRedirect(),HTTPSHandler(context=self.ssl_context)).open(request,timeout=10) as response:
-                return json.load(response)
-        except HTTPError as exc:
-            raise GatewayError(f'Gateway HTTP {exc.code}; task must not be sent without a successful fence') from None
+            response=self.pool.request('GET' if body is None else 'POST',self.base+path,
+                body=None if body is None else json.dumps(body).encode(),
+                headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/json'},
+                timeout=urllib3.Timeout(connect=3,read=10),retries=False,redirect=False)
+        except urllib3.exceptions.HTTPError:
+            raise GatewayError('Gateway transport response uncertain; reconcile without another Enter') from None
+        if response.status!=200:
+            raise GatewayError(f'Gateway HTTP {response.status}; task must not be sent without a successful fence')
+        return json.loads(response.data)
+
+    def close(self):
+        self.pool.clear()
 
     def hello(self):
         result=self.request('/v1/device/hello',self.hello_body)
@@ -122,5 +127,6 @@ class GatewayClient:
                 attempt+=1
                 # Full jitter prevents all clients reconnecting at the same instant.
                 delay=random.uniform(.5,min(60,2**min(attempt,6)))
-                try:await asyncio.wait_for(stop_event.wait(),timeout=delay)
-                except TimeoutError:pass
+                # Native callers pass threading.Event: wait() would block this
+                # event loop forever before wait_for could install its timeout.
+                await asyncio.sleep(delay)

@@ -47,6 +47,9 @@ class Settings:
     backend_token: str = field(repr=False)
     verifier_token: str = field(repr=False)
     redis_url: str = field(default='',repr=False)
+    source_database_url: str = field(default='',repr=False)
+    wecom_webhook: str = field(default='',repr=False)
+    alert_channel: str = 'rpa_monitor'
     redis_namespace: str = 'gateway'
     object_config: dict = field(default_factory=dict,repr=False)
     embedded_worker: bool = False
@@ -69,6 +72,8 @@ class Settings:
         return cls(secret('RPA_GATEWAY_DATABASE_URL'),
                    secret('RPA_GATEWAY_ADMIN_TOKEN'),secret('RPA_GATEWAY_BACKEND_TOKEN'),secret('RPA_GATEWAY_VERIFIER_TOKEN'),
                    redis_url=secret('RPA_GATEWAY_REDIS_URL'),
+                   source_database_url=secret('RPA_GATEWAY_SOURCE_DATABASE_URL'),
+                   wecom_webhook=secret('RPA_GATEWAY_WECOM_WEBHOOK'),
                    redis_namespace=os.environ.get('RPA_GATEWAY_REDIS_NAMESPACE','gateway'),
                    object_config=json.loads(secret('RPA_GATEWAY_OBJECT_CONFIG') or '{}'),
                    embedded_worker=os.environ.get('RPA_GATEWAY_EMBEDDED_WORKER','0')=='1',
@@ -81,7 +86,11 @@ class Settings:
 def make_store(settings,clock=None,pool_size=4):
     presence=Presence(settings.redis_url,settings.redis_namespace,**({'clock':clock} if clock else {})) if settings.redis_url else None
     objects=Objects(settings.object_config) if settings.object_config else None
-    return Store(settings.database,**({'clock':clock} if clock else {}),pool_size=pool_size,presence=presence,objects=objects)
+    store=Store(settings.database,**({'clock':clock} if clock else {}),pool_size=pool_size,presence=presence,objects=objects)
+    if settings.source_database_url:
+        from .source_policy import validate_live_source
+        store.source_validator=lambda payload:validate_live_source(settings.source_database_url,payload)
+    return store
 
 
 class BodyLimit:
@@ -165,7 +174,7 @@ def create_app(settings=None, clock=None):
             if store.presence:await run_in_threadpool(store.presence.close)
             await run_in_threadpool(store.close)
 
-    app = FastAPI(title='QUNL RPA Gateway',version='0.3.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
+    app = FastAPI(title='QUNL RPA Gateway',version='0.4.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
     app.add_middleware(BodyLimit)
     app.add_middleware(HttpMetrics,metrics=metrics)
     app.state.store=store
@@ -237,8 +246,20 @@ def create_app(settings=None, clock=None):
     def health():
         with store.transaction() as db:
             db.execute('SELECT 1').fetchone()
-        return {'service':'rpa-gateway','version':'0.3.0','mode':'isolated_opt_in','ready':True,
+        return {'service':'rpa-gateway','version':'0.5.0','mode':'isolated_opt_in','ready':True,
                 'legacy_connected':False,'storage':'postgresql','instance':settings.instance_id}
+
+    @app.post('/v1/admin/alerts/ingest',dependencies=[Depends(admin)])
+    def alerts_ingest(body:dict):
+        from .alerting import Alerts
+        try:return Alerts(store,settings.wecom_webhook,settings.alert_channel).ingest(body)
+        except ValueError:fail(422,'Invalid alert batch or robot configuration')
+
+    @app.get('/v1/admin/alerts/status',dependencies=[Depends(admin)])
+    def alerts_status():
+        with store.transaction() as db:
+            rows=db.execute('SELECT state,count(*) n FROM alert_deliveries GROUP BY state').fetchall()
+        return {'channel':settings.alert_channel,'configured':bool(settings.wecom_webhook) or settings.alert_channel=='rpa_monitor','counts':{r['state']:r['n'] for r in rows}}
 
     @app.get('/metrics',dependencies=[Depends(admin)])
     def metric_endpoint():return Response(metrics.render(),media_type=CONTENT_TYPE_LATEST)
@@ -354,6 +375,28 @@ def create_app(settings=None, clock=None):
     @app.get('/v1/device/tasks/{task_id}/media/{media_id}/download')
     def download_link(task_id:str,media_id:str,current=Depends(device)):
         return store.download_link(current,task_id,media_id)
+
+    @app.get('/v1/device/tasks/{task_id}')
+    def task_status(task_id:str,current=Depends(device)):
+        return store.device_task(current,task_id)
+
+    @app.get('/v1/device/source-route')
+    def source_route(inbox_id:str,session_id:str,current=Depends(device)):
+        with store.transaction() as db:
+            store.session(db,current,session_id)
+            row=db.execute('SELECT tenant,inbox,device,mode,floor,generation FROM source_routes WHERE tenant=%s AND inbox=%s AND device=%s',
+                           (current['tenant'],inbox_id,current['id'])).fetchone()
+            if row is None:fail(404,'No source route assigned')
+            return dict(row)
+
+    @app.post('/v1/device/source-route/{inbox_id}/ready')
+    def route_ready(inbox_id:str,body:Claim,current=Depends(device)):
+        with store.transaction() as db:
+            store.session(db,current,body.session_id,lock=True)
+            row=db.execute('UPDATE source_routes SET client_ready_at=%s WHERE tenant=%s AND inbox=%s AND device=%s RETURNING mode,floor,generation',
+                           (store.clock(),current['tenant'],inbox_id,current['id'])).fetchone()
+            if row is None:fail(404,'No source route assigned')
+            return dict(row)
 
     @app.post('/v1/device/tasks/{task_id}/receipts')
     def receipt(task_id:str,body:Receipt,current=Depends(device)):

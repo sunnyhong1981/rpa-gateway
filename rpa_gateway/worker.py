@@ -8,9 +8,10 @@ from .objects import verify_image
 
 
 class Worker:
-    def __init__(self,store,metrics=None,media_days=30,event_days=365):
+    def __init__(self,store,metrics=None,media_days=30,event_days=365,alerts=None):
         if media_days<1 or event_days<30:raise ValueError('Retention below safety minimum')
         self.store,self.metrics=store,metrics
+        self.alerts=alerts
         self.media_days,self.event_days=media_days,event_days
 
     def relay(self):
@@ -148,7 +149,9 @@ class Worker:
         tick=0
         while True:
             error=''
-            for operation in (self.relay,self.validate_one,self.externalize_one,self.collect_garbage):
+            operations=(self.relay,self.validate_one,self.externalize_one,self.collect_garbage)
+            if self.alerts:operations=operations+(self.alerts.send_one,)
+            for operation in operations:
                 try:await run_in_threadpool(operation)
                 except Exception as exc:error=type(exc).__name__
             if tick%10==0:
@@ -170,7 +173,8 @@ def main():
     from .app import Settings,make_store
     settings=Settings.from_env()
     store=make_store(settings,pool_size=2)
-    try:asyncio.run(Worker(store,media_days=settings.media_days,event_days=settings.event_days).run())
+    from .alerting import Alerts
+    try:asyncio.run(Worker(store,media_days=settings.media_days,event_days=settings.event_days,alerts=Alerts(store,settings.wecom_webhook)).run())
     finally:store.close()
 
 if __name__=='__main__':main()

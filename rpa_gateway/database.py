@@ -5,7 +5,7 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 TABLES = ('devices','media','tasks','events','archive_claims')
 DDL = '''
 CREATE TABLE IF NOT EXISTS gateway_schema (version INTEGER PRIMARY KEY);
@@ -26,8 +26,6 @@ CREATE TABLE IF NOT EXISTS tasks (
  intent_at DOUBLE PRECISION, submitted_at DOUBLE PRECISION, updated DOUBLE PRECISION NOT NULL,
  UNIQUE(tenant,dedup), FOREIGN KEY(tenant,device) REFERENCES devices(tenant,id));
 CREATE INDEX IF NOT EXISTS tasks_device_state ON tasks(tenant,device,state,created,id);
-CREATE UNIQUE INDEX IF NOT EXISTS one_active_task_per_device ON tasks(tenant,device)
- WHERE state IN ('leased','submitting','submitted','unknown');
 CREATE INDEX IF NOT EXISTS tasks_deadline ON tasks(deadline,tenant,device)
  WHERE state IN ('queued','leased');
 CREATE INDEX IF NOT EXISTS tasks_lease_due ON tasks(lease_until,tenant,device)
@@ -43,6 +41,10 @@ CREATE TABLE IF NOT EXISTS gateway_imports (
  source_sha256 TEXT PRIMARY KEY, imported_at TIMESTAMPTZ NOT NULL DEFAULT now(), summary TEXT NOT NULL);
 '''
 UPGRADE = '''
+ALTER TABLE tasks ADD COLUMN IF NOT EXISTS desktop_released_at DOUBLE PRECISION;
+CREATE UNIQUE INDEX IF NOT EXISTS one_desktop_execution_per_device ON tasks(tenant,device)
+ WHERE state IN ('leased','submitting') OR (state IN ('submitted','unknown') AND desktop_released_at IS NULL);
+DROP INDEX IF EXISTS one_active_task_per_device;
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE media ALTER COLUMN data DROP NOT NULL;
 ALTER TABLE media ADD COLUMN IF NOT EXISTS object_key TEXT;
@@ -68,6 +70,21 @@ CREATE TABLE IF NOT EXISTS worker_health (
 CREATE TABLE IF NOT EXISTS retention_audit (
  id BIGSERIAL PRIMARY KEY, at DOUBLE PRECISION NOT NULL, kind TEXT NOT NULL,
  affected BIGINT NOT NULL, details TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS alert_deliveries (id TEXT PRIMARY KEY,fingerprint TEXT NOT NULL,payload TEXT NOT NULL,state TEXT NOT NULL,created DOUBLE PRECISION NOT NULL,next_at DOUBLE PRECISION NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,delivered_at DOUBLE PRECISION,last_error TEXT NOT NULL DEFAULT '');
+ALTER TABLE alert_deliveries ADD COLUMN IF NOT EXISTS remote_message_id BIGINT;
+CREATE INDEX IF NOT EXISTS alert_pending ON alert_deliveries(next_at) WHERE state='queued';
+CREATE TABLE IF NOT EXISTS source_routes (
+ tenant TEXT NOT NULL, inbox TEXT NOT NULL, device TEXT NOT NULL,
+ mode TEXT NOT NULL CHECK(mode IN ('shadow','gateway','paused')),
+ floor BIGINT NOT NULL, cursor BIGINT NOT NULL, generation BIGINT NOT NULL DEFAULT 1,
+ configured_at DOUBLE PRECISION NOT NULL, client_ready_at DOUBLE PRECISION,
+ PRIMARY KEY(tenant,inbox));
+CREATE TABLE IF NOT EXISTS source_jobs (
+ tenant TEXT NOT NULL, inbox TEXT NOT NULL, message_id BIGINT NOT NULL,
+ task TEXT REFERENCES tasks(id), state TEXT NOT NULL DEFAULT 'pending',
+ error_type TEXT NOT NULL DEFAULT '', attempts INTEGER NOT NULL DEFAULT 0,
+ next_at DOUBLE PRECISION NOT NULL DEFAULT 0, reported_state TEXT,
+ PRIMARY KEY(tenant,inbox,message_id));
 CREATE TABLE IF NOT EXISTS maintenance_cursors (name TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS media_gc (
  object_key TEXT PRIMARY KEY, created DOUBLE PRECISION NOT NULL);
@@ -105,7 +122,7 @@ class Database:
                 if statement.strip():
                     db.execute(statement)
             versions = [row['version'] for row in db.execute('SELECT version FROM gateway_schema')]
-            if versions and versions not in ([1],[SCHEMA_VERSION]):
+            if versions and versions not in ([1],[2],[SCHEMA_VERSION]):
                 raise RuntimeError('Unsupported gateway database schema')
             for statement in UPGRADE.split(';'):
                 if statement.strip():db.execute(statement)

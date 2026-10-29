@@ -63,11 +63,14 @@ class Hub:
         self.stopping=True
         for connection in self.clients.values():connection.invalid=True;self.signal(connection)
         for job in self.jobs:job.cancel()
-        await asyncio.gather(*self.jobs,return_exceptions=True)
+        # Closing the transport first also unblocks a Redis subscription cancelled during startup.
         if self.redis:await self.redis.aclose()
+        if self.jobs:
+            _,pending=await asyncio.wait(self.jobs,timeout=3)
+            for job in pending:job.cancel()
 
     async def subscribe(self):
-        while True:
+        while not self.stopping:
             try:
                 async with self.redis.pubsub() as subscription:
                     await subscription.subscribe(self.presence.channel)
@@ -80,11 +83,12 @@ class Hub:
                             self.signal(connection)
             except asyncio.CancelledError:raise
             except Exception:
+                if self.stopping:break
                 self.metrics.redis_up.set(0)
                 await asyncio.sleep(random.uniform(.5,2))
 
     async def reconcile(self):
-        while True:
+        while not self.stopping:
             await asyncio.sleep(25+random.uniform(0,5))
             clients=tuple(self.clients.values())
             if not clients:continue
