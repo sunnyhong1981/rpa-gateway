@@ -13,6 +13,16 @@ def validate_webhook(value):
     return True
 
 
+def notification_body(body):
+    summary = body['summary']
+    if body['status'] == 'resolved':
+        summary = body.get('recovery_summary') or '相关告警已恢复；原告警：' + summary
+    return (summary + '\n模块：' + body.get('module', 'RPA网关') +
+            '\n规则：' + body.get('alertname', '历史告警') +
+            '\n级别：' + body['severity'] + '\n实例：' + body['instance'] +
+            '\n事件：' + body['fingerprint'][:12])
+
+
 class Alerts:
     def __init__(self,store,webhook='',channel='wecom_robot'):
         validate_webhook(webhook);self.store=store;self.webhook=webhook;self.channel=channel
@@ -31,6 +41,9 @@ class Alerts:
                 identity=[fingerprint,status,str(alert.get('startsAt',''))[:64],str(alert.get('endsAt',''))[:64] if status=='resolved' else '']
                 key=hashlib.sha256(json.dumps(identity,separators=(',',':')).encode()).hexdigest()
                 content={'fingerprint':fingerprint,'status':status,'summary':summary,
+                         'alertname':str(labels.get('alertname',''))[:100],
+                         'module':str(annotations.get('module') or 'RPA网关')[:100],
+                         'recovery_summary':str(annotations.get('recovery_summary') or '')[:500],
                          'instance':str(labels.get('instance',''))[:160],'severity':str(labels.get('severity','warning'))[:20]}
                 if status=='resolved':
                     delivered=db.execute("SELECT 1 FROM alert_deliveries WHERE fingerprint=%s AND state IN ('delivered','published','publish_unknown') LIMIT 1",(fingerprint,)).fetchone()
@@ -49,7 +62,7 @@ class Alerts:
             if not row:return False
             # Keep a bounded send inside a locked transaction; retries may repeat an alert after an ambiguous remote response.
             body=json.loads(row['payload']);title='告警' if body['status']=='firing' else '恢复'
-            text='**RPA网关'+title+'**\n> '+body['summary']+'\n级别：'+body['severity']+'\n实例：'+body['instance']+'\n事件：'+body['fingerprint'][:12]
+            text='**RPA网关'+title+'**\n> '+notification_body(body)
             text=text.encode()[:3800].decode('utf-8','ignore')
             data=json.dumps({'msgtype':'markdown','markdown':{'content':text}},ensure_ascii=False).encode()
             class NoRedirect(HTTPRedirectHandler):

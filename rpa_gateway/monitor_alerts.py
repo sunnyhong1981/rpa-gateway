@@ -1,5 +1,6 @@
 """Gateway alerts through the existing, explicitly selected RPA monitor group."""
 import json,time
+from .alerting import notification_body
 from urllib.request import Request,build_opener,HTTPRedirectHandler
 import psycopg
 from psycopg.rows import dict_row
@@ -20,7 +21,7 @@ class MonitorAlerts:
 
     def publish(self,row):
         body=json.loads(row['payload']);title='告警' if body['status']=='firing' else '恢复'
-        content='RPA网关'+title+'\n'+body['summary']+'\n级别：'+body['severity']+'\n实例：'+body['instance']+'\n事件：'+body['fingerprint'][:12]
+        content='RPA网关'+title+'\n'+notification_body(body)
         content=content.encode()[:3800].decode('utf-8','ignore')
         payload={'content':content,'message_type':'outgoing','private':False,
                  'content_attributes':{'rpa_gateway_alert_id':row['id'],'rpa_gateway_alert_status':body['status']}}

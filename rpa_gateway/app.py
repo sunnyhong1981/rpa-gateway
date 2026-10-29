@@ -139,33 +139,8 @@ def create_app(settings=None, clock=None):
         if hub:await hub.start(settings.redis_url)
         if settings.embedded_worker:
             jobs.append(asyncio.create_task(Worker(store,metrics,settings.media_days,settings.event_days).run()))
-        async def observe():
-            while True:
-                start=time.monotonic()
-                await asyncio.sleep(1)
-                metrics.loop_lag.set(max(0,time.monotonic()-start-1))
-                metrics.rss.set(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*(1 if sys.platform=='darwin' else 1024))
-                metrics.disk_free.set(shutil.disk_usage('/data' if Path('/data').is_dir() else '.').free)
-                try:metrics.fds.set(len(os.listdir('/proc/self/fd' if sys.platform=='linux' else '/dev/fd')))
-                except OSError:pass
-                if int(time.monotonic())%5:continue
-                def snapshot():
-                    with store.transaction() as db:
-                        return db.execute("SELECT (SELECT count(*) FROM outbox WHERE delivered_at IS NULL) pending, (SELECT min(created) FROM outbox WHERE delivered_at IS NULL) oldest, (SELECT count(*) FROM tasks WHERE state='unknown') unknown, (SELECT count(*) FROM tasks WHERE state='queued') queued, (SELECT updated FROM worker_health WHERE name='maintenance') worker, (SELECT count(*) FROM media_uploads WHERE state IN ('queued','validating')) media_pending, (SELECT min(created) FROM media_uploads WHERE state IN ('queued','validating')) media_oldest, (SELECT max(validation_seconds) FROM media_uploads WHERE state='ready' AND updated>EXTRACT(EPOCH FROM now())-300) media_seconds").fetchone()
-                try:
-                    values=await run_in_threadpool(snapshot)
-                    metrics.outbox.set(values['pending']);metrics.outbox_age.set(max(0,store.clock()-(values['oldest'] or store.clock())))
-                    metrics.unknown.set(values['unknown']);metrics.queue.set(values['queued']);metrics.worker.set(values['worker'] or 0)
-                    metrics.pool_wait.set(store.database.pool.get_stats().get('requests_waiting',0))
-                    metrics.media_pending.set(values['media_pending']);metrics.media_oldest.set(max(0,store.clock()-(values['media_oldest'] or store.clock())))
-                    metrics.media_seconds.set(values['media_seconds'] or 0)
-                    if store.objects:
-                        try:metrics.objects_up.set(1 if await run_in_threadpool(store.objects.ready) else 0)
-                        except Exception:metrics.objects_up.set(0)
-                    if store.presence:metrics.redis_up.set(1 if await run_in_threadpool(store.presence.ping) else 0)
-                except asyncio.CancelledError:raise
-                except Exception:metrics.redis_up.set(0)
-        jobs.append(asyncio.create_task(observe()))
+        from .health_observer import HealthObserver
+        jobs.append(asyncio.create_task(HealthObserver(store, metrics).run()))
         try:yield
         finally:
             for job in jobs:job.cancel()

@@ -10,7 +10,22 @@ groups:
         expr: rpa_gateway_redis_up == 0
         for: 30s
         labels: { severity: critical }
-        annotations: { summary: "在线状态不可用，新的发送任务暂停派发" }
+        annotations: { summary: "Redis 在线状态探测失败，依赖该服务的新任务无法安全派发", recovery_summary: "Redis 在线状态探测已恢复", module: "Redis 在线状态服务" }
+      - alert: RPAGatewayDatabaseUnavailable
+        expr: rpa_gateway_database_up == 0
+        for: 30s
+        labels: { severity: critical }
+        annotations: { summary: "数据库连接或统计查询失败", recovery_summary: "数据库探测已恢复", module: "PostgreSQL 数据库" }
+      - alert: RPAGatewayObserverError
+        expr: rpa_gateway_probe_up{component=~"statistics|process"} == 0
+        for: 30s
+        labels: { severity: warning }
+        annotations: { summary: "健康采集器执行失败，相关指标可能未更新", recovery_summary: "健康采集器已恢复", module: "网关健康采集器" }
+      - alert: RPAGatewayProbeStale
+        expr: time() - rpa_gateway_probe_last_completed_timestamp > 60
+        for: 30s
+        labels: { severity: warning }
+        annotations: { summary: "健康探测超过 60 秒没有完成，需检查对应组件", recovery_summary: "健康探测已恢复更新", module: "网关健康采集器" }
       - alert: RPAOutboxLag
         expr: rpa_gateway_outbox_oldest_seconds > 10
         for: 1m
@@ -50,7 +65,7 @@ groups:
         expr: rpa_gateway_objects_up == 0
         for: 1m
         labels: { severity: critical }
-        annotations: { summary: "原图对象存储不可用" }
+        annotations: { summary: "原图对象存储探测失败", recovery_summary: "原图对象存储探测已恢复", module: "对象存储" }
       - alert: RPAMediaValidationBacklog
         expr: rpa_gateway_media_oldest_seconds > 60
         for: 1m

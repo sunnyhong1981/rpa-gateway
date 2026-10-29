@@ -23,6 +23,11 @@ class Metrics:
         self.media_oldest=Gauge('rpa_gateway_media_oldest_seconds','Oldest queued media age',registry=self.registry)
         self.media_seconds=Gauge('rpa_gateway_media_validation_seconds_max5m','Max successful validation duration in last 5 minutes',registry=self.registry)
         self.redis_up=Gauge('rpa_gateway_redis_up','Redis availability',registry=self.registry)
+        self.database_up=Gauge('rpa_gateway_database_up','Database probe availability',registry=self.registry)
+        self.probe_up=Gauge('rpa_gateway_probe_up','Last probe result (1 healthy, 0 failed)',['component'],registry=self.registry)
+        self.probe_success=Gauge('rpa_gateway_probe_last_success_timestamp','Last successful probe timestamp',['component'],registry=self.registry)
+        self.probe_completed=Gauge('rpa_gateway_probe_last_completed_timestamp','Last completed probe timestamp',['component'],registry=self.registry)
+        self.probe_errors=Counter('rpa_gateway_probe_errors_total','Health probe failures',['component','error_type'],registry=self.registry)
         self.worker=Gauge('rpa_gateway_worker_last_success_timestamp','Worker progress timestamp',registry=self.registry)
         self.notifications=Counter('rpa_gateway_notifications_total','Notification actions',['action'],registry=self.registry)
 
