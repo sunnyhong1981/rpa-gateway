@@ -1,0 +1,121 @@
+# LOCAL CANDIDATE ONLY. Review migration/role budgets before any server deployment.
+# docker compose -f deploy/scale.compose.yaml -f deploy/backend-workers.compose.yaml config
+x-source: &source
+  extends: { file: scale.compose.yaml, service: source }
+  image: qunl-rpa-gateway:0.6.0-local
+  command: ['python','-m','rpa_gateway.source_pipeline']
+  healthcheck:
+    test: ['CMD','python','-S','-c',"import os,time;assert time.time()-os.stat(os.environ['RPA_GATEWAY_SOURCE_HEALTH_FILE']).st_mtime<30"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 90s
+x-source-env: &source-env
+  RPA_GATEWAY_SOURCE_CONFIG_FILE: /run/secrets/source_config
+  RPA_GATEWAY_SOURCE_GLOBAL_JOBS: '8'
+  RPA_GATEWAY_SOURCE_PER_GROUP_JOBS: '2'
+  RPA_GATEWAY_SOURCE_NETWORK_SLOTS: '8'
+  RPA_GATEWAY_SOURCE_DECODE_SLOTS: '2'
+  RPA_GATEWAY_SOURCE_IMAGE_WORKERS: '8'
+  RPA_GATEWAY_SOURCE_WORKERS: '4'
+  RPA_GATEWAY_SOURCE_READY_PER_DEVICE: '16'
+  RPA_GATEWAY_SOURCE_READ_POOL_SIZE: '1'
+  RPA_GATEWAY_SOURCE_HEALTH_FILE: /tmp/source-health.json
+x-worker: &worker
+  extends: { file: scale.compose.yaml, service: worker }
+  image: qunl-rpa-gateway:0.6.0-local
+  environment: { RPA_GATEWAY_WORKER_POOL_SIZE: '1' }
+  healthcheck:
+    test: ['CMD','python','-S','-c',"import os,time;assert time.time()-os.stat(os.environ['RPA_GATEWAY_WORKER_HEALTH_FILE']).st_mtime<30"]
+    interval: 10s
+    timeout: 5s
+    retries: 3
+    start_period: 90s
+services:
+  source:
+    profiles: ['legacy-workers-disabled']
+    deploy: { replicas: 0 }
+  worker:
+    profiles: ['legacy-workers-disabled']
+    deploy: { replicas: 0 }
+  gateway-a:
+    image: qunl-rpa-gateway:0.6.0-local
+    cpus: 0.25
+    environment: { RPA_GATEWAY_POOL_SIZE: '3' }
+  gateway-b:
+    image: qunl-rpa-gateway:0.6.0-local
+    cpus: 0.25
+    environment: { RPA_GATEWAY_POOL_SIZE: '3' }
+  media:
+    image: qunl-rpa-gateway:0.6.0-local
+    cpus: 0.15
+    environment: { RPA_GATEWAY_POOL_SIZE: '2' }
+  source-capture:
+    <<: *source
+    cpus: 0.05
+    mem_limit: 128m
+    environment:
+      <<: *source-env
+      RPA_GATEWAY_SOURCE_ROLE: capture
+      RPA_GATEWAY_SOURCE_POOL_SIZE: '1'
+      RPA_GATEWAY_INSTANCE_ID: capture
+  source-prepare-a:
+    <<: *source
+    cpus: 0.2
+    mem_limit: 512m
+    environment:
+      <<: *source-env
+      RPA_GATEWAY_SOURCE_ROLE: prepare
+      RPA_GATEWAY_SOURCE_POOL_SIZE: '2'
+      RPA_GATEWAY_INSTANCE_ID: prepare-a
+  source-prepare-b:
+    <<: *source
+    cpus: 0.2
+    mem_limit: 512m
+    environment:
+      <<: *source-env
+      RPA_GATEWAY_SOURCE_ROLE: prepare
+      RPA_GATEWAY_SOURCE_POOL_SIZE: '2'
+      RPA_GATEWAY_INSTANCE_ID: prepare-b
+  source-archive:
+    <<: *source
+    cpus: 0.1
+    mem_limit: 128m
+    environment:
+      <<: *source-env
+      RPA_GATEWAY_SOURCE_ROLE: archive
+      RPA_GATEWAY_SOURCE_POOL_SIZE: '1'
+      RPA_GATEWAY_INSTANCE_ID: archive
+  source-receipts:
+    <<: *source
+    cpus: 0.05
+    mem_limit: 128m
+    environment:
+      <<: *source-env
+      RPA_GATEWAY_SOURCE_ROLE: receipts
+      RPA_GATEWAY_SOURCE_POOL_SIZE: '1'
+      RPA_GATEWAY_INSTANCE_ID: receipts
+  dispatch:
+    <<: *worker
+    cpus: 0.05
+    mem_limit: 128m
+    environment: { RPA_GATEWAY_WORKER_ROLE: dispatch, RPA_GATEWAY_WORKER_POOL_SIZE: '1', RPA_GATEWAY_WORKER_HEALTH_FILE: /tmp/worker-health.json }
+  validation:
+    <<: *worker
+    cpus: 0.15
+    mem_limit: 384m
+    environment: { RPA_GATEWAY_WORKER_ROLE: validation, RPA_GATEWAY_WORKER_POOL_SIZE: '1', RPA_GATEWAY_WORKER_HEALTH_FILE: /tmp/worker-health.json }
+  maintenance:
+    <<: *worker
+    cpus: 0.05
+    mem_limit: 128m
+    environment: { RPA_GATEWAY_WORKER_ROLE: maintenance, RPA_GATEWAY_WORKER_POOL_SIZE: '1', RPA_GATEWAY_WORKER_HEALTH_FILE: /tmp/worker-health.json }
+  alert-delivery:
+    image: qunl-rpa-gateway:0.6.0-local
+    cpus: 0.05
+    mem_limit: 128m
+  redis: { cpus: 0.1 }
+  objects: { cpus: 0.15 }
+  ingress: { cpus: 0.05 }
+  prometheus: { cpus: 0.05 }
+  alertmanager: { cpus: 0.05 }

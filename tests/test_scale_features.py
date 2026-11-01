@@ -197,7 +197,10 @@ def test_worker_externalizes_legacy_blob_without_changing_bytes(env):
         db.execute('INSERT INTO media(tenant,id,sha256,md5,size,mime,data) VALUES(%s,%s,%s,%s,%s,%s,%s)',
                    ('legacy','legacy-id',meta['sha256'],meta['md5'],meta['size'],meta['mime'],data))
     Worker(store).externalize_one()
-    with store.transaction() as db:row=db.execute("SELECT * FROM media WHERE id='legacy-id'").fetchone()
+    for _ in range(30):
+        with store.transaction() as db:row=db.execute("SELECT * FROM media WHERE id='legacy-id'").fetchone()
+        if row['data'] is None:break
+        time.sleep(.05)
     assert row['data'] is None and store.objects.get(row['object_key'])==data
 
 

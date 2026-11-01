@@ -47,6 +47,9 @@ class Settings:
     backend_token: str = field(repr=False)
     verifier_token: str = field(repr=False)
     redis_url: str = field(default='',repr=False)
+    source_database_url: str = field(default='',repr=False)
+    wecom_webhook: str = field(default='',repr=False)
+    alert_channel: str = 'rpa_monitor'
     redis_namespace: str = 'gateway'
     object_config: dict = field(default_factory=dict,repr=False)
     embedded_worker: bool = False
@@ -54,12 +57,14 @@ class Settings:
     media_days: int = 30
     event_days: int = 365
     instance_id: str = field(default_factory=lambda:uuid.uuid4().hex)
+    database_pool_size: int = 4
 
 
     def __post_init__(self):
         tokens = (self.admin_token, self.backend_token, self.verifier_token)
         if any(len(t) < 32 for t in tokens) or len(set(tokens)) != 3:
             raise ValueError('Three distinct credentials of at least 32 characters are required')
+        if not 1<=self.database_pool_size<=16:raise ValueError('Invalid database pool budget')
 
     @classmethod
     def from_env(cls):
@@ -69,19 +74,26 @@ class Settings:
         return cls(secret('RPA_GATEWAY_DATABASE_URL'),
                    secret('RPA_GATEWAY_ADMIN_TOKEN'),secret('RPA_GATEWAY_BACKEND_TOKEN'),secret('RPA_GATEWAY_VERIFIER_TOKEN'),
                    redis_url=secret('RPA_GATEWAY_REDIS_URL'),
+                   source_database_url=secret('RPA_GATEWAY_SOURCE_DATABASE_URL'),
+                   wecom_webhook=secret('RPA_GATEWAY_WECOM_WEBHOOK'),
                    redis_namespace=os.environ.get('RPA_GATEWAY_REDIS_NAMESPACE','gateway'),
                    object_config=json.loads(secret('RPA_GATEWAY_OBJECT_CONFIG') or '{}'),
                    embedded_worker=os.environ.get('RPA_GATEWAY_EMBEDDED_WORKER','0')=='1',
                    allow_media_proxy=os.environ.get('RPA_GATEWAY_MEDIA_PROXY','0')=='1',
                    media_days=int(os.environ.get('RPA_GATEWAY_MEDIA_DAYS','30')),
                    event_days=int(os.environ.get('RPA_GATEWAY_EVENT_DAYS','365')),
-                   instance_id=os.environ.get('RPA_GATEWAY_INSTANCE_ID',uuid.uuid4().hex))
+                   instance_id=os.environ.get('RPA_GATEWAY_INSTANCE_ID',uuid.uuid4().hex),
+                   database_pool_size=int(os.environ.get('RPA_GATEWAY_POOL_SIZE','4')))
 
 
 def make_store(settings,clock=None,pool_size=4):
     presence=Presence(settings.redis_url,settings.redis_namespace,**({'clock':clock} if clock else {})) if settings.redis_url else None
     objects=Objects(settings.object_config) if settings.object_config else None
-    return Store(settings.database,**({'clock':clock} if clock else {}),pool_size=pool_size,presence=presence,objects=objects)
+    store=Store(settings.database,**({'clock':clock} if clock else {}),pool_size=pool_size,presence=presence,objects=objects)
+    if settings.source_database_url:
+        from .source_policy import validate_live_source
+        store.source_validator=lambda payload:validate_live_source(settings.source_database_url,payload)
+    return store
 
 
 class BodyLimit:
@@ -118,7 +130,7 @@ class BodyLimit:
 
 def create_app(settings=None, clock=None):
     settings = settings or Settings.from_env()
-    store=make_store(settings,clock)
+    store=make_store(settings,clock,pool_size=settings.database_pool_size)
     metrics=Metrics()
     hub=Hub(store,store.presence,metrics,instance_id=settings.instance_id) if store.presence else None
     uploads=Uploads(store)
@@ -130,33 +142,8 @@ def create_app(settings=None, clock=None):
         if hub:await hub.start(settings.redis_url)
         if settings.embedded_worker:
             jobs.append(asyncio.create_task(Worker(store,metrics,settings.media_days,settings.event_days).run()))
-        async def observe():
-            while True:
-                start=time.monotonic()
-                await asyncio.sleep(1)
-                metrics.loop_lag.set(max(0,time.monotonic()-start-1))
-                metrics.rss.set(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss*(1 if sys.platform=='darwin' else 1024))
-                metrics.disk_free.set(shutil.disk_usage('/data' if Path('/data').is_dir() else '.').free)
-                try:metrics.fds.set(len(os.listdir('/proc/self/fd' if sys.platform=='linux' else '/dev/fd')))
-                except OSError:pass
-                if int(time.monotonic())%5:continue
-                def snapshot():
-                    with store.transaction() as db:
-                        return db.execute("SELECT (SELECT count(*) FROM outbox WHERE delivered_at IS NULL) pending, (SELECT min(created) FROM outbox WHERE delivered_at IS NULL) oldest, (SELECT count(*) FROM tasks WHERE state='unknown') unknown, (SELECT count(*) FROM tasks WHERE state='queued') queued, (SELECT updated FROM worker_health WHERE name='maintenance') worker, (SELECT count(*) FROM media_uploads WHERE state IN ('queued','validating')) media_pending, (SELECT min(created) FROM media_uploads WHERE state IN ('queued','validating')) media_oldest, (SELECT max(validation_seconds) FROM media_uploads WHERE state='ready' AND updated>EXTRACT(EPOCH FROM now())-300) media_seconds").fetchone()
-                try:
-                    values=await run_in_threadpool(snapshot)
-                    metrics.outbox.set(values['pending']);metrics.outbox_age.set(max(0,store.clock()-(values['oldest'] or store.clock())))
-                    metrics.unknown.set(values['unknown']);metrics.queue.set(values['queued']);metrics.worker.set(values['worker'] or 0)
-                    metrics.pool_wait.set(store.database.pool.get_stats().get('requests_waiting',0))
-                    metrics.media_pending.set(values['media_pending']);metrics.media_oldest.set(max(0,store.clock()-(values['media_oldest'] or store.clock())))
-                    metrics.media_seconds.set(values['media_seconds'] or 0)
-                    if store.objects:
-                        try:metrics.objects_up.set(1 if await run_in_threadpool(store.objects.ready) else 0)
-                        except Exception:metrics.objects_up.set(0)
-                    if store.presence:metrics.redis_up.set(1 if await run_in_threadpool(store.presence.ping) else 0)
-                except asyncio.CancelledError:raise
-                except Exception:metrics.redis_up.set(0)
-        jobs.append(asyncio.create_task(observe()))
+        from .health_observer import HealthObserver
+        jobs.append(asyncio.create_task(HealthObserver(store, metrics).run()))
         try:yield
         finally:
             for job in jobs:job.cancel()
@@ -165,7 +152,7 @@ def create_app(settings=None, clock=None):
             if store.presence:await run_in_threadpool(store.presence.close)
             await run_in_threadpool(store.close)
 
-    app = FastAPI(title='QUNL RPA Gateway',version='0.3.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
+    app = FastAPI(title='QUNL RPA Gateway',version='0.4.0',docs_url=None,redoc_url=None,openapi_url=None,lifespan=lifespan)
     app.add_middleware(BodyLimit)
     app.add_middleware(HttpMetrics,metrics=metrics)
     app.state.store=store
@@ -237,8 +224,20 @@ def create_app(settings=None, clock=None):
     def health():
         with store.transaction() as db:
             db.execute('SELECT 1').fetchone()
-        return {'service':'rpa-gateway','version':'0.3.0','mode':'isolated_opt_in','ready':True,
+        return {'service':'rpa-gateway','version':'0.6.0-local','mode':'isolated_opt_in','ready':True,
                 'legacy_connected':False,'storage':'postgresql','instance':settings.instance_id}
+
+    @app.post('/v1/admin/alerts/ingest',dependencies=[Depends(admin)])
+    def alerts_ingest(body:dict):
+        from .alerting import Alerts
+        try:return Alerts(store,settings.wecom_webhook,settings.alert_channel).ingest(body)
+        except ValueError:fail(422,'Invalid alert batch or robot configuration')
+
+    @app.get('/v1/admin/alerts/status',dependencies=[Depends(admin)])
+    def alerts_status():
+        with store.transaction() as db:
+            rows=db.execute('SELECT state,count(*) n FROM alert_deliveries GROUP BY state').fetchall()
+        return {'channel':settings.alert_channel,'configured':bool(settings.wecom_webhook) or settings.alert_channel=='rpa_monitor','counts':{r['state']:r['n'] for r in rows}}
 
     @app.get('/metrics',dependencies=[Depends(admin)])
     def metric_endpoint():return Response(metrics.render(),media_type=CONTENT_TYPE_LATEST)
@@ -354,6 +353,28 @@ def create_app(settings=None, clock=None):
     @app.get('/v1/device/tasks/{task_id}/media/{media_id}/download')
     def download_link(task_id:str,media_id:str,current=Depends(device)):
         return store.download_link(current,task_id,media_id)
+
+    @app.get('/v1/device/tasks/{task_id}')
+    def task_status(task_id:str,current=Depends(device)):
+        return store.device_task(current,task_id)
+
+    @app.get('/v1/device/source-route')
+    def source_route(inbox_id:str,session_id:str,current=Depends(device)):
+        with store.transaction() as db:
+            store.session(db,current,session_id)
+            row=db.execute('SELECT tenant,inbox,device,mode,floor,generation FROM source_routes WHERE tenant=%s AND inbox=%s AND device=%s',
+                           (current['tenant'],inbox_id,current['id'])).fetchone()
+            if row is None:fail(404,'No source route assigned')
+            return dict(row)
+
+    @app.post('/v1/device/source-route/{inbox_id}/ready')
+    def route_ready(inbox_id:str,body:Claim,current=Depends(device)):
+        with store.transaction() as db:
+            store.session(db,current,body.session_id,lock=True)
+            row=db.execute('UPDATE source_routes SET client_ready_at=%s WHERE tenant=%s AND inbox=%s AND device=%s RETURNING mode,floor,generation',
+                           (store.clock(),current['tenant'],inbox_id,current['id'])).fetchone()
+            if row is None:fail(404,'No source route assigned')
+            return dict(row)
 
     @app.post('/v1/device/tasks/{task_id}/receipts')
     def receipt(task_id:str,body:Receipt,current=Depends(device)):

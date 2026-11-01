@@ -8,9 +8,10 @@ from .objects import verify_image
 
 
 class Worker:
-    def __init__(self,store,metrics=None,media_days=30,event_days=365):
+    def __init__(self,store,metrics=None,media_days=30,event_days=365,alerts=None):
         if media_days<1 or event_days<30:raise ValueError('Retention below safety minimum')
         self.store,self.metrics=store,metrics
+        self.alerts=alerts
         self.media_days,self.event_days=media_days,event_days
 
     def relay(self):
@@ -138,39 +139,62 @@ class Worker:
                        (page.get('NextContinuationToken'),))
             return count
 
-    def observe(self,error=''):
-        store=self.store
-        with store.transaction() as db:
-            db.execute("INSERT INTO worker_health(name,updated,error_type) VALUES('maintenance',%s,%s) ON CONFLICT(name) DO UPDATE SET updated=EXCLUDED.updated,error_type=EXCLUDED.error_type",(store.clock(),error))
+    def observe(self,error='',name='maintenance',progress=None,active=0):
+        with self.store.transaction() as db:
+            db.execute("""INSERT INTO worker_health(name,updated,error_type,last_progress,active_jobs) VALUES(%s,%s,%s,%s,%s)
+              ON CONFLICT(name) DO UPDATE SET updated=EXCLUDED.updated,error_type=EXCLUDED.error_type,
+              last_progress=EXCLUDED.last_progress,active_jobs=EXCLUDED.active_jobs""",
+              (name,self.store.clock(),error,progress,active))
+        import os
+        from pathlib import Path
+        path=os.environ.get('RPA_GATEWAY_WORKER_HEALTH_FILE')
+        if path:
+            target=Path(path);pending=target.with_suffix('.next')
+            pending.write_text(json.dumps({'at':time.time(),'role':name}))
+            pending.replace(target)
 
-    async def run(self):
+    async def run(self,role='all'):
         from starlette.concurrency import run_in_threadpool
-        tick=0
-        while True:
-            error=''
-            for operation in (self.relay,self.validate_one,self.externalize_one,self.collect_garbage):
-                try:await run_in_threadpool(operation)
-                except Exception as exc:error=type(exc).__name__
-            if tick%10==0:
-                try:await run_in_threadpool(self.sweep)
-                except Exception as exc:error=type(exc).__name__
-            if tick%600==0:
-                try:
-                    await run_in_threadpool(self.retain)
-                    await run_in_threadpool(self.reconcile_orphans)
-                except Exception as exc:error=type(exc).__name__
-            if tick%20==0:
-                try:await run_in_threadpool(self.observe,error)
-                except Exception:pass
-            tick+=1
-            await asyncio.sleep(.1)
+        roles=('dispatch','validation','maintenance') if role=='all' else (role,)
+        if any(name not in ('dispatch','validation','maintenance') for name in roles):
+            raise ValueError('Unknown worker role')
+        state={name:{'error':'','progress':None,'active':0} for name in roles}
+        async def operations(name):
+            last_housekeeping=0
+            while True:
+                error='';state[name]['active']=1
+                if name=='dispatch':callbacks=(self.relay,self.sweep)
+                elif name=='validation':callbacks=(self.validate_one,self.externalize_one)
+                else:
+                    callbacks=(self.collect_garbage,)
+                    if self.alerts:callbacks+=(self.alerts.send_one,)
+                    if time.monotonic()-last_housekeeping>=60:
+                        callbacks+=(self.retain,self.reconcile_orphans);last_housekeeping=time.monotonic()
+                for callback in callbacks:
+                    try:await run_in_threadpool(callback)
+                    except Exception as exc:error=type(exc).__name__
+                state[name].update(error=error,progress=self.store.clock(),active=0)
+                await asyncio.sleep(1 if name=='maintenance' else .1)
+        async def health():
+            while True:
+                for name,values in state.items():
+                    try:await run_in_threadpool(self.observe,values['error'],name,values['progress'],values['active'])
+                    except Exception:pass
+                await asyncio.sleep(1)
+        jobs=[asyncio.create_task(operations(name)) for name in roles]+[asyncio.create_task(health())]
+        try:await asyncio.gather(*jobs)
+        finally:
+            for job in jobs:job.cancel()
+            await asyncio.gather(*jobs,return_exceptions=True)
 
 
 def main():
     from .app import Settings,make_store
+    import os
     settings=Settings.from_env()
-    store=make_store(settings,pool_size=2)
-    try:asyncio.run(Worker(store,media_days=settings.media_days,event_days=settings.event_days).run())
+    store=make_store(settings,pool_size=int(os.environ.get('RPA_GATEWAY_WORKER_POOL_SIZE','2')))
+    from .alerting import Alerts
+    try:asyncio.run(Worker(store,media_days=settings.media_days,event_days=settings.event_days,alerts=Alerts(store,settings.wecom_webhook)).run(os.environ.get('RPA_GATEWAY_WORKER_ROLE','all')))
     finally:store.close()
 
 if __name__=='__main__':main()

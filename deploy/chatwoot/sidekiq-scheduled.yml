@@ -1,0 +1,6 @@
+# Monitor sweeps must not sit behind report generation.
+:concurrency: 2
+:timeout: 25
+:max_retries: 3
+:queues:
+  - scheduled_jobs

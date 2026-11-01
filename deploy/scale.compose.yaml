@@ -1,6 +1,6 @@
 name: qunl-rpa-gateway-scale
 x-runtime: &runtime
-  image: qunl-rpa-gateway:0.3.0
+  image: qunl-rpa-gateway:0.5.0
   init: true
   restart: unless-stopped
   read_only: true
@@ -17,13 +17,15 @@ x-runtime: &runtime
     RPA_GATEWAY_ADMIN_TOKEN_FILE: /run/secrets/admin_token
     RPA_GATEWAY_BACKEND_TOKEN_FILE: /run/secrets/backend_token
     RPA_GATEWAY_VERIFIER_TOKEN_FILE: /run/secrets/verifier_token
+    RPA_GATEWAY_SOURCE_DATABASE_URL_FILE: /run/secrets/source_database_url
+    RPA_GATEWAY_WECOM_WEBHOOK_FILE: /run/secrets/wecom_webhook
     RPA_GATEWAY_REDIS_URL_FILE: /run/secrets/redis_url
     RPA_GATEWAY_OBJECT_CONFIG_FILE: /run/secrets/object_config
     RPA_GATEWAY_REDIS_NAMESPACE: scale-v3
     RPA_GATEWAY_MEDIA_PROXY: "0"
     RPA_GATEWAY_MEDIA_DAYS: "30"
     RPA_GATEWAY_EVENT_DAYS: "365"
-  secrets: [database_url,admin_token,backend_token,verifier_token,redis_url,object_config]
+  secrets: [database_url,admin_token,backend_token,verifier_token,redis_url,object_config,source_database_url,wecom_webhook]
   logging:
     driver: json-file
     options: { max-size: '5m', max-file: '3' }
@@ -58,6 +60,21 @@ services:
       test: ['CMD','python','-c',"import os,time,psycopg;from pathlib import Path;c=psycopg.connect(Path(os.environ['RPA_GATEWAY_DATABASE_URL_FILE']).read_text().strip(),connect_timeout=3,options='-c statement_timeout=3000',application_name='rpa-gateway-healthcheck');r=c.execute(\"SELECT updated FROM worker_health WHERE name='maintenance'\").fetchone();c.close();assert r and time.time()-r[0]<60"]
       interval: 30s
       timeout: 10s
+      retries: 3
+  source:
+    <<: *runtime
+    command: ['python','-m','rpa_gateway.source_bridge']
+    environment:
+      <<: *environment
+      RPA_GATEWAY_SOURCE_CONFIG_FILE: /run/secrets/source_config
+      RPA_GATEWAY_SOURCE_DATABASE_URL_FILE: /run/secrets/source_database_url
+    secrets: [database_url,admin_token,backend_token,verifier_token,redis_url,object_config,source_config,source_database_url,wecom_webhook]
+    networks: [gateway,chatwoot]
+    mem_limit: 192m
+    healthcheck:
+      test: ['CMD','python','-c',"import os,time,psycopg;from pathlib import Path;c=psycopg.connect(Path(os.environ['RPA_GATEWAY_DATABASE_URL_FILE']).read_text().strip(),connect_timeout=3);r=c.execute(\"SELECT updated,error_type FROM worker_health WHERE name='source:469'\").fetchone();c.close();assert r and time.time()-r[0]<30 and not r[1]"]
+      interval: 30s
+      timeout: 5s
       retries: 3
   redis:
     image: redis:7.4-alpine
@@ -100,6 +117,30 @@ services:
     cpus: 0.2
     ulimits: { nofile: { soft: 16384, hard: 16384 } }
     depends_on: [gateway-a,gateway-b,media,objects]
+  alert-delivery:
+    <<: *runtime
+    command: ['python','-m','rpa_gateway.monitor_alerts']
+    environment:
+      <<: *environment
+      RPA_GATEWAY_MONITOR_ALERT_CONFIG_FILE: /run/secrets/monitor_alert_config
+    secrets: [database_url,admin_token,backend_token,verifier_token,redis_url,object_config,source_database_url,wecom_webhook,monitor_alert_config]
+    networks: [gateway,chatwoot]
+    mem_limit: 192m
+    healthcheck:
+      test: ['CMD','python','-c',"import os,time,psycopg;from pathlib import Path;c=psycopg.connect(Path(os.environ['RPA_GATEWAY_DATABASE_URL_FILE']).read_text().strip(),connect_timeout=3);r=c.execute(\"SELECT updated,error_type FROM worker_health WHERE name='alerts'\").fetchone();c.close();assert r and time.time()-r[0]<30 and not r[1]"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    restart: unless-stopped
+    user: "10001:10001"
+    command: ['--config.file=/etc/alertmanager/alertmanager.yml','--storage.path=/alertmanager']
+    volumes: ['./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro','../runtime/alertmanager:/alertmanager']
+    secrets: [admin_token]
+    networks: [gateway]
+    mem_limit: 64m
+    cpus: 0.1
   prometheus:
     image: prom/prometheus:v3.2.1
     user: "10001:10001"
@@ -112,6 +153,10 @@ services:
     mem_limit: 128m
     cpus: 0.2
 secrets:
+  monitor_alert_config: { file: ../runtime/secrets/monitor_alert_config }
+  wecom_webhook: { file: ../runtime/secrets/wecom_webhook }
+  source_config: { file: ../runtime/secrets/source_config }
+  source_database_url: { file: ../runtime/secrets/source_database_url }
   database_url: { file: ../runtime/secrets/database_url }
   admin_token: { file: ../runtime/secrets/admin_token }
   backend_token: { file: ../runtime/secrets/backend_token }
@@ -121,6 +166,9 @@ secrets:
   object_config: { file: ../runtime/secrets/object_config }
   object_identity: { file: ../runtime/secrets/object_identity }
 networks:
+  chatwoot:
+    external: true
+    name: chatwoot_default
   gateway:
     external: true
     name: qunl-rpa-gateway_isolated

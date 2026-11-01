@@ -1,0 +1,36 @@
+# Candidate override for an explicitly selected Chatwoot base compose file.
+# It is never loaded by the gateway's normal deployment command.
+x-sidekiq: &sidekiq
+  extends:
+    file: ${CHATWOOT_BASE_COMPOSE:?Set the reviewed Chatwoot base compose path}
+    service: sidekiq
+  restart: unless-stopped
+  networks: [default]
+services:
+  sidekiq:
+    profiles: ['legacy-workers-disabled']
+    deploy: { replicas: 0 }
+  sidekiq-realtime:
+    <<: *sidekiq
+    command: ['bundle','exec','sidekiq','-C','/etc/sidekiq/realtime.yml']
+    cpus: 0.5
+    mem_limit: 1024m
+    environment: { RAILS_MAX_THREADS: '4', SIDEKIQ_CONCURRENCY: '4' }
+    volumes: ['./sidekiq-realtime.yml:/etc/sidekiq/realtime.yml:ro']
+  sidekiq-scheduled:
+    <<: *sidekiq
+    command: ['bundle','exec','sidekiq','-C','/etc/sidekiq/scheduled.yml']
+    cpus: 0.15
+    mem_limit: 512m
+    environment: { RAILS_MAX_THREADS: '2', SIDEKIQ_CONCURRENCY: '2' }
+    volumes: ['./sidekiq-scheduled.yml:/etc/sidekiq/scheduled.yml:ro']
+  sidekiq-background:
+    <<: *sidekiq
+    command: ['bundle','exec','sidekiq','-C','/etc/sidekiq/background.yml']
+    cpus: 0.15
+    mem_limit: 512m
+    environment:
+      RAILS_MAX_THREADS: '1'
+      SIDEKIQ_CONCURRENCY: '1'
+      PGOPTIONS: '-c statement_timeout=30000 -c max_parallel_workers_per_gather=0 -c work_mem=8MB'
+    volumes: ['./sidekiq-background.yml:/etc/sidekiq/background.yml:ro']

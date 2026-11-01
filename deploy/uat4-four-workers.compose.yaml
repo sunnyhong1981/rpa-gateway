@@ -1,0 +1,34 @@
+# Initial UAT4 gateway trial: four total preparations, one preparer process.
+x-four: &four
+  RPA_GATEWAY_SOURCE_GLOBAL_JOBS: '4'
+  RPA_GATEWAY_SOURCE_PER_GROUP_JOBS: '2'
+  RPA_GATEWAY_SOURCE_NETWORK_SLOTS: '4'
+  RPA_GATEWAY_SOURCE_DECODE_SLOTS: '2'
+  RPA_GATEWAY_SOURCE_WORKERS: '4'
+  RPA_GATEWAY_SOURCE_IMAGE_WORKERS: '4'
+services:
+  gateway-a: { image: 'qunl-rpa-gateway:0.6.0-uat4-four' }
+  gateway-b: { image: 'qunl-rpa-gateway:0.6.0-uat4-four' }
+  media: { image: 'qunl-rpa-gateway:0.6.0-uat4-four' }
+  source-capture:
+    image: qunl-rpa-gateway:0.6.0-uat4-four
+    cpus: 0.1
+    environment: { <<: *four }
+  source-prepare-a:
+    image: qunl-rpa-gateway:0.6.0-uat4-four
+    environment: { <<: *four }
+  source-prepare-b:
+    profiles: ['eight-workers-disabled']
+    deploy: { replicas: 0 }
+    environment: { <<: *four }
+  source-archive:
+    image: qunl-rpa-gateway:0.6.0-uat4-four
+    environment: { <<: *four }
+  source-receipts:
+    image: qunl-rpa-gateway:0.6.0-uat4-four
+    cpus: 0.1
+    environment: { <<: *four }
+  dispatch: { image: 'qunl-rpa-gateway:0.6.0-uat4-four', cpus: 0.1 }
+  validation: { image: 'qunl-rpa-gateway:0.6.0-uat4-four' }
+  maintenance: { image: 'qunl-rpa-gateway:0.6.0-uat4-four', cpus: 0.1 }
+  alert-delivery: { image: 'qunl-rpa-gateway:0.6.0-uat4-four', cpus: 0.15 }

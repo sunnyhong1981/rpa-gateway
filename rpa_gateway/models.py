@@ -18,6 +18,7 @@ class Hello(Model):
     protocol: int = Field(ge=1, le=1)
     installation_id: str = Field(pattern=ID)
     runtime_version: str = Field(min_length=1, max_length=64)
+    worker_instance_id: str = Field(default='', pattern=r'^[A-Za-z0-9_-]{0,96}$')
     capabilities: list[Literal['text_v1', 'caption_images_v1', 'official_identity_v1']] = Field(max_length=3)
 
 class Heartbeat(Model):
@@ -38,6 +39,7 @@ class TaskCreate(Model):
     caption: str = Field(min_length=1, max_length=8000)
     media_ids: list[str] = Field(default_factory=list, max_length=9)
     ttl_seconds: int = Field(default=180, ge=15, le=3600)
+    context: dict = Field(default_factory=dict)
 
 class Claim(Model):
     session_id: str = Field(pattern=ID)
@@ -46,8 +48,12 @@ class Receipt(Model):
     session_id: str = Field(pattern=ID)
     lease_token: str = Field(min_length=20, max_length=128)
     event_id: str = Field(pattern=ID)
-    state: Literal['renew', 'submitting', 'submitted', 'unknown', 'failed_pre_submit']
+    state: Literal['renew', 'submitting', 'submitted', 'desktop_released', 'quarantine_released', 'unknown', 'failed_pre_submit']
     reason: str = Field(default='', max_length=256)
+    native_submit_complete: bool = False
+    desktop_idle_verified: bool = False
+    input_cleared: bool = False
+    group_verified: bool = False
 
 class Evidence(Model):
     event_id: str = Field(min_length=1, max_length=128)
