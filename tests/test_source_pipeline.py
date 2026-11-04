@@ -360,6 +360,7 @@ def test_source_container_health_check_reuses_the_existing_database_pool(env,tmp
     import json
     with closing(SourceFixture(env)) as fixture,closing(SourcePipeline(env.app.state.store,env.settings.database,fixture.configs)) as pipeline:
         marker=tmp_path/'health.json';monkeypatch.setenv('RPA_GATEWAY_SOURCE_HEALTH_FILE',str(marker))
+        pipeline.prepare_once()  # A successful empty scan establishes actual role progress.
         pipeline.heartbeat(('prepare',))
         value=json.loads(marker.read_text())
         assert value['roles']==['prepare'] and value['instance']==pipeline.instance

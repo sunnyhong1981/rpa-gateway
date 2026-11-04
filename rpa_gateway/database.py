@@ -103,6 +103,7 @@ ALTER TABLE source_jobs ADD COLUMN IF NOT EXISTS report_next_at DOUBLE PRECISION
 ALTER TABLE source_jobs ADD COLUMN IF NOT EXISTS report_error TEXT NOT NULL DEFAULT '';
 CREATE INDEX IF NOT EXISTS source_pending_jobs ON source_jobs(tenant,inbox,next_at,message_id) WHERE task IS NULL AND state IN ('pending','preparing');
 CREATE INDEX IF NOT EXISTS source_active_leases ON source_jobs(lease_until) WHERE task IS NULL AND state='preparing';
+CREATE INDEX IF NOT EXISTS source_task_lookup ON source_jobs(task) WHERE task IS NOT NULL;
 CREATE TABLE IF NOT EXISTS source_scheduling (
  tenant TEXT NOT NULL,inbox TEXT NOT NULL,last_claimed DOUBLE PRECISION NOT NULL DEFAULT 0,
  capture_owner TEXT,capture_until DOUBLE PRECISION,PRIMARY KEY(tenant,inbox));

@@ -1,0 +1,6 @@
+# Apply only after reviewing the isolated receipt-worker image and deployment approval.
+# Keep the image pinned to a build containing the reviewed source_pipeline.py patch.
+services:
+  source-receipts:
+    image: ${RPA_GATEWAY_RECEIPTS_RECOVERY_IMAGE:?Set the reviewed receipt recovery image}
+    restart: unless-stopped

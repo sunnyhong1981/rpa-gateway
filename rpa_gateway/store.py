@@ -301,7 +301,20 @@ class Store:
                 return {'task':None,'reason':'archive_confirmation_backlog'}
             hello = json.loads(row['hello'])
             caps = set(hello['capabilities'])
-            task = db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND state='queued' ORDER BY created,id LIMIT 1 FOR UPDATE SKIP LOCKED",
+            # Preparation stays parallel, but a later reply in the same group
+            # cannot overtake an earlier captured reply that has not submitted.
+            # Once the desktop is released, archive confirmation stays async.
+            task = db.execute("""SELECT t.* FROM tasks t LEFT JOIN source_jobs j ON j.task=t.id
+                WHERE t.tenant=%s AND t.device=%s AND t.state='queued'
+                AND NOT EXISTS (
+                    SELECT 1 FROM source_jobs earlier LEFT JOIN tasks predecessor ON predecessor.id=earlier.task
+                    LEFT JOIN source_routes route ON route.tenant=earlier.tenant AND route.inbox=earlier.inbox
+                    WHERE earlier.tenant=j.tenant AND earlier.inbox=j.inbox AND earlier.message_id<j.message_id
+                    AND ((earlier.task IS NULL AND earlier.state IN ('pending','preparing')
+                          AND route.mode='gateway' AND route.device=t.device AND earlier.message_id>route.floor)
+                         OR (predecessor.device=t.device AND predecessor.state IN ('queued','leased','submitting')))
+                )
+                ORDER BY t.created,t.id LIMIT 1 FOR UPDATE OF t SKIP LOCKED""",
                               (row['tenant'],row['id'])).fetchone()
             if task is None:
                 return {'task': None, 'reason': 'empty'}

@@ -49,15 +49,26 @@ class SourcePipeline:
         self._progress('capture')
 
     def prepare_once(self):
-        for future in list(self.preparing):
-            if future.done():
-                future.result();self.preparing.pop(future);self._progress('prepare')
+        error=self._reap(self.preparing,'prepare')
         while len(self.preparing)<self.settings.workers and not self.stop.is_set():
             job=self.queue.claim()
             if job is None:break
             bridge=self.bridges[(job['tenant'],job['inbox'])]
             future=self.preparers.submit(bridge.prepare,job,self.stop);self.preparing[future]=job
+        if error:raise error
         if not self.preparing:self._progress('prepare')
+
+    def _reap(self,pending,role):
+        error=None
+        for future in list(pending):
+            if not future.done():continue
+            # Remove before reading the result: a failed Future stays failed
+            # forever. Retaining it would poison every subsequent scheduler tick.
+            pending.pop(future)
+            try:future.result()
+            except Exception as exc:error=error or exc
+            else:self._progress(role)
+        return error
 
     def archive_once(self):
         error=None
@@ -68,14 +79,13 @@ class SourcePipeline:
         self._progress('archive')
 
     def receipt_once(self):
-        for future in list(self.reporting):
-            if future.done():
-                future.result();self.reporting.pop(future);self._progress('receipts')
+        error=self._reap(self.reporting,'receipts')
         while len(self.reporting)<self.settings.report_workers and not self.stop.is_set():
             job=self.queue.claim_report()
             if job is None:break
             bridge=self.bridges[(job['tenant'],job['inbox'])]
             future=self.reporters.submit(bridge.publish_report,job);self.reporting[future]=job
+        if error:raise error
         if not self.reporting:self._progress('receipts')
 
     def heartbeat(self,roles):
@@ -90,8 +100,18 @@ class SourcePipeline:
         path=os.environ.get('RPA_GATEWAY_SOURCE_HEALTH_FILE')
         if path:
             target=Path(path);pending=target.with_suffix('.next')
-            pending.write_text(json.dumps({'at':time.time(),'roles':list(roles),'instance':self.instance}))
-            pending.replace(target)
+            components={role:{'error_type':self.errors.get(role,''),
+                              'last_progress':self.progress.get(role)} for role in roles}
+            healthy=all(not row['error_type'] and row['last_progress'] is not None
+                        and 0<=now-row['last_progress']<30 for row in components.values())
+            if healthy:
+                pending.write_text(json.dumps({'at':time.time(),'roles':list(roles),
+                                              'instance':self.instance,'components':components}))
+                pending.replace(target)
+            else:
+                # Existing deployment checks this file's freshness. A live
+                # heartbeat thread must not mask a failed or stalled work role.
+                target.unlink(missing_ok=True)
 
     def start(self,role='all'):
         roles=ROLES if role=='all' else (role,)
