@@ -71,7 +71,15 @@
 {"session_id":"server-returned-session","lease_token":"server-returned-lease-token","event_id":"persisted-local-event-id","state":"submitting","reason":""}
 ```
 
-`state` 可为 `renew / submitting / submitted / unknown / failed_pre_submit`。重试同一个事件必须使用相同 ID 和内容；冲突返回 409。确认提交只接受从 leased 到 submitting 的首次转移。网络异常时切勿新造事件 ID 尝试重复发送。参考 SDK 的 `begin_submit()` 会拒绝重复回执授权 Enter。
+`state` 可为 `renew / submitting / submitted / desktop_released / unknown / failed_pre_submit`。重试同一个事件必须使用相同 ID 和内容；冲突返回 409。确认提交只接受从 leased 到 submitting 的首次转移。网络异常时切勿新造事件 ID 尝试重复发送。参考 SDK 的 `begin_submit()` 会拒绝重复回执授权 Enter。
+
+v0.5 新增 `desktop_released` 回执：必须先持久确认 `submitted`，并且原生发送返回成功、输入框清空、群身份复核完成，客户端也已持久记录这些检查后才可发送。三个校验字段必须全部为 true：
+
+```json
+{"session_id":"server-returned-session","lease_token":"server-returned-lease-token","event_id":"persisted-release-event-id","state":"desktop_released","native_submit_complete":true,"input_cleared":true,"group_verified":true}
+```
+
+此回执保持任务为 `submitted`，只写入 `desktop_released_at`，不确认送达。随后可串行执行下一单，最多 3 单等待存档；任何 `unknown` 仍阻止新领取及新的提交意图。老客户端不发此回执，继续等待存档后才领取下一单。相同事件可以幂等补报，不能因此再按 Enter。参见 [PIPELINE.md](PIPELINE.md)。
 
 证据确认示例结构：
 

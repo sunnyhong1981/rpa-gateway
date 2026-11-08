@@ -1,16 +1,18 @@
 import hashlib
+import logging
 import json
 import secrets
 import time
 import uuid
 import redis
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from fastapi import HTTPException
 from .database import Database
 
 ACTIVE = ('leased', 'submitting', 'submitted', 'unknown')
 TERMINAL = ('confirmed', 'failed', 'expired', 'cancelled', 'closed_unconfirmed')
+MAX_PENDING_ARCHIVES = 3
 
 
 def fail(code, message):
@@ -26,8 +28,14 @@ class Store:
         self.clock = clock
         self.presence = presence
         self.objects = objects
+        self.source_validator = None
+        self.managed_backend = None
         self.database = Database(dsn, pool_size=pool_size)
         self.database.initialize()
+        with self.transaction() as db:
+            db.execute("SELECT pg_advisory_xact_lock(hashtext(current_database()),hashtext(current_schema() || ':managed_delivery_checks'))")
+            db.execute("CREATE TABLE IF NOT EXISTS managed_delivery_checks(task TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,next_at DOUBLE PRECISION NOT NULL DEFAULT 0,error_type TEXT NOT NULL DEFAULT '')")
+
 
     def close(self):
         self.database.close()
@@ -108,6 +116,49 @@ class Store:
                 fail(409, 'Device already exists; rotate explicitly')
         return {'device_id': body.device_id, 'token': token}
 
+    def ensure_managed_device(self, tenant, body):
+        bindings=[{'inbox_id':b.inbox_id,'room_id':b.room_id}for b in body.bindings]
+        if len({b['inbox_id']for b in bindings})!=len(bindings) or len({b['room_id']for b in bindings})!=len(bindings):
+            fail(422,'Duplicate managed group')
+        scope=json.dumps({'device_id':body.device_id,'bindings':bindings,'managed_delivery':True,'managed_installation':body.installation_id},sort_keys=True)
+        with self.transaction() as db:
+            db.execute('INSERT INTO devices(tenant,id,token_hash,scope) VALUES(%s,%s,%s,%s) ON CONFLICT(id) DO NOTHING',
+                       (tenant,body.device_id,body.token_hash,scope))
+            row=self.lock_device(db,tenant,body.device_id)
+            changed=row['token_hash']!=body.token_hash or row['scope']!=scope or row['revoked']!=0
+            rotated=row['token_hash']!=body.token_hash or row['revoked']!=0
+            if changed:
+                db.execute('UPDATE devices SET token_hash=%s,scope=%s,revoked=0,session=CASE WHEN %s THEN NULL ELSE session END,seen=CASE WHEN %s THEN NULL ELSE seen END WHERE tenant=%s AND id=%s',
+                           (body.token_hash,scope,rotated,rotated,tenant,body.device_id))
+                self.notify(db,tenant,body.device_id,'credential_changed' if rotated else 'bindings_changed')
+                if self.presence and rotated:self.presence.invalidate(row)
+            previous=list(db.execute('SELECT * FROM source_routes WHERE tenant=%s AND device=%s FOR UPDATE',(tenant,body.device_id)))
+            included={b.inbox_id for b in body.bindings}
+            for route in previous:
+                if route['inbox']not in included:
+                    db.execute("UPDATE source_routes SET mode='paused',generation=generation+1,configured_at=%s WHERE tenant=%s AND inbox=%s",(self.clock(),tenant,route['inbox']))
+            result=[]
+            for binding in body.bindings:
+                old=db.execute('SELECT * FROM source_routes WHERE tenant=%s AND inbox=%s FOR UPDATE',(tenant,binding.inbox_id)).fetchone()
+                if old is None:
+                    db.execute("INSERT INTO source_routes(tenant,inbox,device,mode,floor,cursor,generation,configured_at) VALUES(%s,%s,%s,'gateway',%s,%s,1,%s)",
+                               (tenant,binding.inbox_id,body.device_id,binding.floor,binding.floor,self.clock()))
+                elif old['device']!=body.device_id or old['mode']!='gateway':
+                    db.execute("UPDATE source_routes SET device=%s,mode='gateway',floor=%s,cursor=GREATEST(cursor,%s),generation=generation+1,configured_at=%s WHERE tenant=%s AND inbox=%s",
+                               (body.device_id,binding.floor,binding.floor,self.clock(),tenant,binding.inbox_id))
+                current=db.execute('SELECT floor,generation FROM source_routes WHERE tenant=%s AND inbox=%s',(tenant,binding.inbox_id)).fetchone()
+                result.append(dict(inbox_id=binding.inbox_id,room_id=binding.room_id,**current))
+        return {'device_id':body.device_id,'bindings':result,'changed':changed}
+
+    def revoke_managed(self,tenant,device_id,token_hash):
+        with self.transaction() as db:
+            row=db.execute('SELECT * FROM devices WHERE tenant=%s AND id=%s FOR UPDATE',(tenant,device_id)).fetchone()
+            if not row or row['token_hash']!=token_hash or row['revoked']:return {'revoked':False,'changed':False}
+            db.execute('UPDATE devices SET revoked=1,session=NULL,seen=NULL WHERE tenant=%s AND id=%s',(tenant,device_id))
+            self.notify(db,tenant,device_id,'credential_changed')
+            if self.presence:self.presence.invalidate(row)
+        return {'revoked':True,'changed':True}
+
     def credentials(self, tenant, device_id, rotate=False):
         token = secrets.token_urlsafe(36)
         with self.transaction() as db:
@@ -148,41 +199,70 @@ class Store:
     def hello(self, device, body):
         with self.transaction() as db:
             row = self.current_device(db, device, lock=True)
-            # Persist the same session for retrying handshakes from an installation;
-            # a different installation may take over only without active desktop work.
-            active = db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state IN (%s,%s,%s,%s)",
-                                (row['tenant'],row['id'],*ACTIVE)).fetchone()
-            if row['installation'] != body.installation_id and active:
-                fail(409, 'Active or uncertain work prevents installation takeover')
-            if row['session'] and row['installation'] == body.installation_id:
-                if json.loads(row['hello']) != body.model_dump():
+            # A stable installation is not a process identity. A second live
+            # runtime must not share its session or overwrite its health.
+            scope=json.loads(row['scope'])
+            if scope.get('managed_installation') and scope['managed_installation']!=body.installation_id:
+                fail(409,'Managed installation does not match enrollment')
+            previous = json.loads(row['hello'] or '{}')
+            owner_started = previous.pop('_owner_started_at', None)
+            previous_owner = previous.get('worker_instance_id', '')
+            incoming = body.model_dump()
+            same_owner = previous_owner == body.worker_instance_id
+            if row['session'] and row['installation'] == body.installation_id and same_owner:
+                previous.setdefault('worker_instance_id', '')
+                if previous != incoming:
                     fail(409, 'Capabilities cannot change during a session; use credential rotation')
-                return {'session_id': row['session'], 'protocol': 1, 'heartbeat_seconds': 15}
+                return {'session_id': row['session'], 'protocol': 1, 'heartbeat_seconds': 15, 'bindings':scope['bindings']}
+            if row['session']:
+                if self.presence:
+                    try:
+                        health = self.presence.health(row)
+                    except redis.RedisError:
+                        fail(503, 'Owner health unavailable; takeover paused')
+                else:
+                    health = json.loads(row['heartbeat'] or '{}')
+                    health['seen'] = row['seen']
+                seen = health.get('seen')
+                if seen is None: seen = owner_started
+                if seen is not None and 0 <= self.clock() - seen <= 45:
+                    fail(409, 'Device already owned by a live worker')
+                # Legacy callers cannot take over active work. Modern owners
+                # recover after heartbeat expiry; every old
+                # claim/Enter fence then fails against the new SQL session.
+                active = db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state IN (%s,%s,%s,%s)",
+                                    (row['tenant'],row['id'],*ACTIVE)).fetchone()
+                if active and not body.worker_instance_id:
+                    fail(409, 'Active or uncertain work prevents installation takeover')
             sid = uuid.uuid4().hex
             db.execute('UPDATE devices SET session=%s,installation=%s,hello=%s,heartbeat=NULL,seen=NULL WHERE tenant=%s AND id=%s',
-                       (sid, body.installation_id, json.dumps(body.model_dump()),row['tenant'],row['id']))
+                       (sid, body.installation_id, json.dumps({**body.model_dump(), '_owner_started_at': self.clock()}),row['tenant'],row['id']))
             self.notify(db,row['tenant'],row['id'],'session_changed')
+            logging.getLogger('uvicorn.error').info('event=runtime_owner_changed tenant=%s device=%s previous_worker=%s worker=%s old_session_hash=%s session_hash=%s', row['tenant'],row['id'],previous_owner,body.worker_instance_id,digest(row['session'] or '')[:12],digest(sid)[:12])
             if self.presence:
                 try:self.presence.invalidate(row)
                 except redis.RedisError:pass
-            return {'session_id': sid, 'protocol': 1, 'heartbeat_seconds': 15}
+            return {'session_id': sid, 'protocol': 1, 'heartbeat_seconds': 15, 'bindings':scope['bindings']}
 
     def heartbeat(self, device, body):
-        if self.presence:
-            if device['session']!=body.session_id:fail(409,'Session superseded; handshake required')
-            try:self.presence.beat(device,body)
-            except redis.RedisError:fail(503,'Online state unavailable; new sends paused')
-            return {'accepted':True}
+        # Always validate ownership against SQL, including Redis heartbeats.
+        # An auth cache from a superseded session cannot overwrite new health.
         with self.transaction() as db:
-            self.session(db,device,body.session_id,lock=True)
-            db.execute('UPDATE devices SET heartbeat=%s,seen=%s WHERE tenant=%s AND id=%s',
-                       (json.dumps(body.model_dump()),self.clock(),device['tenant'],device['id']))
+            current = self.session(db,device,body.session_id,lock=True)
+            if self.presence:
+                try:self.presence.beat(current,body)
+                except redis.RedisError:fail(503,'Online state unavailable; new sends paused')
+            else:
+                db.execute('UPDATE devices SET heartbeat=%s,seen=%s WHERE tenant=%s AND id=%s',
+                           (json.dumps(body.model_dump()),self.clock(),device['tenant'],device['id']))
         return {'accepted':True}
 
     def put_media(self, tenant, data, mime, _verified=None):
         from .objects import verify_image
         meta=_verified or verify_image(data)
         sha=meta['sha256']
+        cached=self.cached_media(tenant,sha)
+        if cached:return cached
         object_key=None
         if self.objects:
             object_key=self.objects.key(tenant,sha)+'-'+uuid.uuid4().hex
@@ -200,15 +280,28 @@ class Store:
             # delayed orphan reconciliation checks the database before any object deletion.
             raise
 
-    def create_task(self, tenant, body):
+    def cached_media(self,tenant,sha):
+        with self.transaction() as db:
+            row=db.execute('SELECT id,sha256,md5,size,mime FROM media WHERE tenant=%s AND sha256=%s AND deleting=false',
+                           (tenant,sha)).fetchone()
+            return dict(row) if row else None
+
+    def create_task(self, tenant, body, *, transaction=None):
         payload = body.model_dump()
+        managed=(payload.get('context')or{}).get('provider')=='chatwoot_managed'
         if len(set(body.media_ids)) != len(body.media_ids):
             fail(422, 'Duplicate media in one task')
         # TTL is not part of identity: retries must not extend the original request deadline.
         identity = [body.inbox_id,body.source_message_id,body.waybill,'caption_images' if body.media_ids else 'text']
         dedup = digest(json.dumps(identity))
         canonical = json.dumps(payload, sort_keys=True)
-        with self.transaction() as db:
+        if managed:
+            with self.transaction() as db:existing=db.execute('SELECT * FROM tasks WHERE tenant=%s AND dedup=%s',(tenant,dedup)).fetchone()
+            if existing:
+                if existing['payload']!=canonical:fail(409,'Idempotency conflict: original task content differs')
+                return self.present(existing)
+            if self.managed_backend is None or not self.managed_backend.verify(payload):fail(409,'Managed source is unavailable or changed')
+        with (self.transaction() if transaction is None else nullcontext(transaction)) as db:
             old = db.execute('SELECT * FROM tasks WHERE tenant=%s AND dedup=%s', (tenant,dedup)).fetchone()
             if old:
                 if old['payload'] != canonical:
@@ -238,10 +331,47 @@ class Store:
                 return self.present(existing)
             task = db.execute('SELECT * FROM tasks WHERE id=%s', (task_id,)).fetchone()
             self.event(db,task,'queued')
+            if managed:db.execute('INSERT INTO managed_delivery_checks(task) VALUES(%s) ON CONFLICT DO NOTHING',(task_id,))
             return self.present(task)
 
+    def reconcile_managed_once(self):
+        if self.managed_backend is None:return False
+        now=self.clock()
+        with self.transaction() as db:
+            row=db.execute("SELECT t.* FROM managed_delivery_checks c JOIN tasks t ON t.id=c.task WHERE c.next_at<=%s AND t.state IN ('submitting','submitted','unknown') AND t.intent_at IS NOT NULL ORDER BY c.next_at,t.created LIMIT 1 FOR UPDATE OF c SKIP LOCKED",(now,)).fetchone()
+            if row is None:return False
+            db.execute('UPDATE managed_delivery_checks SET next_at=%s WHERE task=%s',(now+5,row['id']))
+            task=dict(row)
+        payload=json.loads(task['payload'])
+        result=self.managed_backend.request('reconcile',payload,after=task['intent_at'])
+        proof=result.get('evidence')or{}
+        expected=payload['context']['source_fingerprint']
+        if result.get('verified')is not True:return True
+        if (result.get('source_fingerprint')!=expected or proof.get('source_fingerprint')!=expected
+            or proof.get('room_id')!=payload['room_id'] or proof.get('sender_id')!=payload['robot_id']):
+            raise ValueError('Managed archive proof differs from task')
+        ids=proof.get('event_ids')
+        if not isinstance(ids,list)or not ids or len(ids)>30 or any(not isinstance(v,str)or not v or len(v)>256 for v in ids):
+            raise ValueError('Managed archive proof lacks event identities')
+        with self.transaction() as db:
+            self.lock_device(db,task['tenant'],task['device'])
+            current=db.execute('SELECT * FROM tasks WHERE id=%s FOR UPDATE',(task['id'],)).fetchone()
+            if current['state']=='confirmed':return True
+            if current['state']not in('submitting','submitted','unknown'):return True
+            for event in set(ids):
+                old=db.execute('SELECT task FROM archive_claims WHERE tenant=%s AND event_id=%s FOR UPDATE',(task['tenant'],event)).fetchone()
+                if old and old['task']!=task['id']:raise ValueError('Official archive event already used by another task')
+            for event in set(ids):
+                db.execute('INSERT INTO archive_claims VALUES(%s,%s,%s) ON CONFLICT DO NOTHING',(task['tenant'],event,task['id']))
+                owned=db.execute('SELECT task FROM archive_claims WHERE tenant=%s AND event_id=%s',(task['tenant'],event)).fetchone()
+                if owned['task']!=task['id']:raise ValueError('Official archive event already claimed')
+            db.execute('UPDATE tasks SET submitted_at=COALESCE(submitted_at,%s) WHERE id=%s',(now,task['id']))
+            self.transition(db,current,'confirmed',{'managed_official_evidence':proof})
+            db.execute('DELETE FROM managed_delivery_checks WHERE task=%s',(task['id'],))
+        return True
+
     def present(self, task, device_view=False, db=None):
-        result = {k: task[k] for k in ('id','tenant','device','state','created','deadline','updated')}
+        result = {k: task[k] for k in ('id','tenant','device','state','created','deadline','updated','desktop_released_at')}
         result['payload'] = json.loads(task['payload'])
         if device_view:
             # Immutable expected hashes accompany the task, independent of download headers.
@@ -257,17 +387,40 @@ class Store:
         with self.transaction() as db:
             row = self.session(db, device, body.session_id, ready=True, lock=True)
             self.sweep(db, row)
-            if db.execute('SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state IN (%s,%s,%s,%s)',
-                          (row['tenant'],row['id'],*ACTIVE)).fetchone():
+            if db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND (state IN ('leased','submitting') OR (state='submitted' AND desktop_released_at IS NULL) OR (state='unknown' AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task=tasks.id AND e.details::jsonb->>'state'='quarantine_released')))",
+                          (row['tenant'],row['id'])).fetchone():
                 return {'task': None, 'reason': 'device_busy_or_awaiting_confirmation'}
+            pending=db.execute("SELECT count(*) n FROM tasks WHERE tenant=%s AND device=%s AND state='submitted' AND desktop_released_at IS NOT NULL",
+                               (row['tenant'],row['id'])).fetchone()['n']
+            if pending>=MAX_PENDING_ARCHIVES:
+                return {'task':None,'reason':'archive_confirmation_backlog'}
             hello = json.loads(row['hello'])
             caps = set(hello['capabilities'])
-            task = db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND state='queued' ORDER BY created,id LIMIT 1 FOR UPDATE SKIP LOCKED",
-                              (row['tenant'],row['id'])).fetchone()
+            # Preparation stays parallel, but a later reply in the same group
+            # cannot overtake an earlier captured reply that has not submitted.
+            # Once the desktop is released, archive confirmation stays async.
+            if body.inbox_ids is not None:
+                allowed={b['inbox_id']for b in json.loads(row['scope'])['bindings']}
+                if len(set(body.inbox_ids))!=len(body.inbox_ids)or not set(body.inbox_ids)<=allowed:fail(403,'Claim inboxes outside device scope')
+                task=db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND state='queued' AND payload::jsonb->>'inbox_id'=ANY(%s) ORDER BY array_position(%s::text[],payload::jsonb->>'inbox_id'),CASE WHEN (payload::jsonb->>'source_message_id')~'^[0-9]+$' THEN (payload::jsonb->>'source_message_id')::numeric ELSE 0 END,created,id LIMIT 1 FOR UPDATE SKIP LOCKED",(row['tenant'],row['id'],body.inbox_ids,body.inbox_ids)).fetchone()
+            else:
+                task = db.execute("""SELECT t.* FROM tasks t LEFT JOIN source_jobs j ON j.task=t.id
+                    WHERE t.tenant=%s AND t.device=%s AND t.state='queued'
+                    AND NOT EXISTS (
+                        SELECT 1 FROM source_jobs earlier LEFT JOIN tasks predecessor ON predecessor.id=earlier.task
+                        LEFT JOIN source_routes route ON route.tenant=earlier.tenant AND route.inbox=earlier.inbox
+                        WHERE earlier.tenant=j.tenant AND earlier.inbox=j.inbox AND earlier.message_id<j.message_id
+                        AND ((earlier.task IS NULL AND earlier.state IN ('pending','preparing')
+                              AND route.mode='gateway' AND route.device=t.device AND earlier.message_id>route.floor)
+                             OR (predecessor.device=t.device AND predecessor.state IN ('queued','leased','submitting')))
+                    )
+                    ORDER BY t.created,t.id LIMIT 1 FOR UPDATE OF t SKIP LOCKED""",
+                                  (row['tenant'],row['id'])).fetchone()
             if task is None:
                 return {'task': None, 'reason': 'empty'}
             payload = json.loads(task['payload'])
             required = {'official_identity_v1','caption_images_v1' if payload['media_ids'] else 'text_v1'}
+            if payload.get('context',{}).get('provider')=='chatwoot_managed':required.add('managed_delivery_v1')
             if not required <= caps:
                 return {'task': None, 'reason': 'capability_missing'}
             db.execute("UPDATE tasks SET state='leased',lease_token=%s,lease_until=%s,session=%s,updated=%s WHERE id=%s",
@@ -289,11 +442,14 @@ class Store:
             owner = self.session(db,device,body.session_id,lock=True)
             self.sweep(db,owner)
             task = self.owned_task(db,device,task_id,lock=True)
-            if task['session'] != body.session_id or task['lease_token'] != body.lease_token:
+            if task['lease_token'] != body.lease_token or (task['session'] != body.session_id and body.state != 'quarantine_released'):
                 fail(409,'Stale lease; never send with this token')
             old = db.execute('SELECT * FROM events WHERE task=%s AND event_id=%s',(task_id,body.event_id)).fetchone()
             receipt_body = body.model_dump()
             receipt_body.pop('lease_token')
+            if body.state not in ('desktop_released', 'quarantine_released'):
+                for field in ('native_submit_complete','input_cleared','group_verified'):receipt_body.pop(field)
+            if body.state != 'quarantine_released': receipt_body.pop('desktop_idle_verified')
             if old:
                 if json.loads(old['details']) != receipt_body:
                     fail(409,'Receipt idempotency conflict')
@@ -308,12 +464,44 @@ class Store:
                 if state != 'leased':
                     fail(409,'Submission requires a live unsubmitted lease')
                 self.session(db,device,body.session_id,ready=True)
+                if db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state='unknown' AND id<>%s AND NOT EXISTS (SELECT 1 FROM events e WHERE e.task=tasks.id AND e.details::jsonb->>'state'='quarantine_released')",
+                              (owner['tenant'],owner['id'],task_id)).fetchone():
+                    fail(409,'Uncertain work requires reconciliation before another native Enter')
+                snapshot=json.loads(task['payload'])
+                if (snapshot.get('context') or {}).get('source_fingerprint'):
+                    if (snapshot.get('context')or{}).get('provider')=='chatwoot_managed':
+                        if self.managed_backend is None or not self.managed_backend.verify(snapshot):
+                            fail(409,'Managed source is unavailable or changed; no Enter allowed')
+                    else:
+                        if self.source_validator is None:fail(503,'Official source validator unavailable; no Enter allowed')
+                        self.source_validator(snapshot)
                 # This is the irreversible fence. A timeout after this is unknown, never requeued.
                 db.execute("UPDATE tasks SET state='submitting',intent_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
             elif body.state == 'submitted':
-                if state != 'submitting':
-                    fail(409,'Submit intent must be durably acknowledged before UI Enter')
-                db.execute("UPDATE tasks SET state='submitted',submitted_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
+                managed=json.loads(task['payload']).get('context',{}).get('provider')=='chatwoot_managed'
+                if state=='confirmed' and managed:pass  # Official evidence can precede the transport acknowledgement.
+                elif state != 'submitting':fail(409,'Submit intent must be durably acknowledged before UI Enter')
+                else:db.execute("UPDATE tasks SET state='submitted',submitted_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
+            elif body.state == 'desktop_released':
+                if not all((body.native_submit_complete,body.input_cleared,body.group_verified)):
+                    fail(409,'Native submission, cleared input and exact group must all be verified')
+                if state not in ('submitted','confirmed') or task['submitted_at'] is None:
+                    fail(409,'Desktop can only be released after a persisted submitted receipt')
+                if task['desktop_released_at'] is not None:
+                    fail(409,'Desktop release already recorded; retry the original event identity')
+                db.execute('UPDATE tasks SET desktop_released_at=%s,updated=%s WHERE id=%s',(now,now,task_id))
+            elif body.state == 'quarantine_released':
+                if state != 'unknown' or task['intent_at'] is None:
+                    fail(409, 'Only an uncertain attempted task can release its desktop quarantine')
+                if now - task['intent_at'] < 300:
+                    fail(409, 'Desktop quarantine requires at least 300 seconds after submit intent')
+                self.session(db, device, body.session_id, ready=True)
+                if not all((body.desktop_idle_verified, body.input_cleared, body.group_verified)):
+                    fail(409, 'Recovery requires an idle desktop, cleared input and exact group')
+                if db.execute("SELECT 1 FROM events WHERE task=%s AND details::jsonb->>'state'='quarantine_released'", (task_id,)).fetchone():
+                    fail(409, 'Desktop quarantine already released; retry original event identity')
+                # Preserve unknown in the audit queue, never confirm or requeue it.
+                db.execute('UPDATE tasks SET desktop_released_at=%s,updated=%s WHERE id=%s', (now,now,task_id))
             elif body.state == 'unknown':
                 if state not in ('submitting','submitted','unknown'):
                     fail(409,'No submission intent exists')
@@ -353,7 +541,18 @@ class Store:
             row=self.session(db,device,session_id)
             tasks=[dict(t) for t in db.execute("SELECT id,state,updated FROM tasks WHERE tenant=%s AND device=%s AND state IN ('queued','leased','submitting','submitted','unknown') ORDER BY created,id LIMIT 100",
                                               (device['tenant'],device['id']))]
-            return {'type':'tasks_changed','tasks':tasks,'cursor':row['revision'],'claim_via':'HTTPS'}
+            routes=[dict(r)for r in db.execute('SELECT tenant,inbox,device,mode,floor,generation FROM source_routes WHERE tenant=%s AND device=%s',(device['tenant'],device['id']))]
+            return {'type':'tasks_changed','tasks':tasks,'bindings':json.loads(row['scope'])['bindings'],'routes':routes,'cursor':row['revision'],'claim_via':'HTTPS'}
+
+    def device_task(self,device,task_id):
+        with self.transaction() as db:
+            task=self.owned_task(db,device,task_id)
+            result=self.present(task)
+            result.update(intent_at=task['intent_at'],submitted_at=task['submitted_at'])
+            result['quarantine_released_at'] = db.execute(
+                "SELECT min(at) released_at FROM events WHERE task=%s AND details::jsonb->>'state'='quarantine_released'",
+                (task_id,)).fetchone()['released_at']
+            return result
 
     def lookup_task(self, db, tenant, task_id, sweep=False):
         task = db.execute('SELECT * FROM tasks WHERE tenant=%s AND id=%s',(tenant,task_id)).fetchone()
@@ -387,8 +586,16 @@ class Store:
                    e.occurred_at < task['intent_at']-2 or e.occurred_at > self.clock()+5 or
                    e.occurred_at > task['intent_at']+600 for e in events):
                 fail(422,'Archive scope, actor or submission time mismatch')
+            release = db.execute("SELECT min(at) cutoff FROM events WHERE task=%s AND details::jsonb->>'state'='quarantine_released'",(task_id,)).fetchone()['cutoff']
+            if release is not None and any(e.occurred_at > release for e in events):
+                fail(422,'Archive occurred after quarantine release; cannot attribute a later send to this task')
             text = [e.text for e in events if e.kind=='text']
-            if text != [payload['caption']]:
+            allowed=[payload['caption']]
+            context=payload.get('context') or {}
+            name=(context.get('reply_target') or {}).get('sender_name','')
+            if context.get('provider')=='chatwoot_official' and name and len(name)<=120:
+                allowed.extend(['@'+name+' '+payload['caption'], '回复 '+name+'：\n'+payload['caption']])
+            if len(text)!=1 or text[0] not in allowed:
                 fail(422,'Expected exact single caption')
             expected = Counter()
             for media_id in payload['media_ids']:
