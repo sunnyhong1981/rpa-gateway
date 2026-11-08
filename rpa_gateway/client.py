@@ -3,6 +3,7 @@ import hashlib
 import json
 import uuid
 import ssl
+import urllib3
 from urllib.error import HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -10,6 +11,17 @@ from urllib.request import Request, urlopen
 
 class GatewayError(RuntimeError):
     pass
+
+
+class GatewaySessionError(GatewayError):
+    """The gateway fenced this runtime; only a new hello can refresh it."""
+
+
+class GatewayOwnershipError(GatewayError):
+    """A different live worker owns the device; do not steal its session."""
+
+
+WORKER_INSTANCE_ID = uuid.uuid4().hex
 
 
 class GatewayClient:
@@ -20,21 +32,33 @@ class GatewayClient:
         self.ssl_context=ssl.create_default_context(cafile=ca_file)
         self.base=base_url.rstrip('/')
         self.token=token
-        self.hello_body={'protocol':1,'installation_id':installation_id,'runtime_version':runtime_version,'capabilities':capabilities}
+        self.hello_body={'protocol':1,'installation_id':installation_id,'runtime_version':runtime_version,'capabilities':capabilities,'worker_instance_id':WORKER_INSTANCE_ID}
         self.session_id=None
+        self.pool=urllib3.PoolManager(num_pools=2,maxsize=4,block=True,ssl_context=self.ssl_context)
 
     def request(self,path,body=None):
-        request=Request(self.base+path,data=None if body is None else json.dumps(body).encode(),headers={
-            'Authorization':'Bearer '+self.token,'Content-Type':'application/json'},method='GET' if body is None else 'POST')
-        # Never follow a redirect carrying a credential to another host.
-        from urllib.request import HTTPRedirectHandler, HTTPSHandler, build_opener
-        class NoRedirect(HTTPRedirectHandler):
-            def redirect_request(self,*args,**kwargs): return None
+        # Reuse TLS connections. Never retry or redirect a POST/send fence.
         try:
-            with build_opener(NoRedirect(),HTTPSHandler(context=self.ssl_context)).open(request,timeout=10) as response:
-                return json.load(response)
-        except HTTPError as exc:
-            raise GatewayError(f'Gateway HTTP {exc.code}; task must not be sent without a successful fence') from None
+            response=self.pool.request('GET' if body is None else 'POST',self.base+path,
+                body=None if body is None else json.dumps(body).encode(),
+                headers={'Authorization':'Bearer '+self.token,'Content-Type':'application/json'},
+                timeout=urllib3.Timeout(connect=3,read=10),retries=False,redirect=False)
+        except urllib3.exceptions.HTTPError:
+            raise GatewayError('Gateway transport response uncertain; reconcile without another Enter') from None
+        if response.status != 200:
+            try:
+                detail = json.loads(response.data).get('detail', '')
+            except (ValueError, AttributeError):
+                detail = ''
+            if response.status == 409 and detail == 'Session superseded; handshake required':
+                raise GatewaySessionError('Gateway session superseded; hello required')
+            if response.status == 409 and detail == 'Device already owned by a live worker':
+                raise GatewayOwnershipError('Gateway device already owned by another live worker')
+            raise GatewayError(f'Gateway HTTP {response.status}; task must not be sent without a successful fence')
+        return json.loads(response.data)
+
+    def close(self):
+        self.pool.clear()
 
     def hello(self):
         result=self.request('/v1/device/hello',self.hello_body)
@@ -42,8 +66,13 @@ class GatewayClient:
         return result
 
     def heartbeat(self,*,worker_alive,desktop_unlocked,wecom_logged_in,auto_send):
-        return self.request('/v1/device/heartbeat',{'session_id':self.session_id,'worker_alive':worker_alive,
-            'desktop_unlocked':desktop_unlocked,'wecom_logged_in':wecom_logged_in,'auto_send':auto_send})
+        body = dict(worker_alive=worker_alive, desktop_unlocked=desktop_unlocked,
+                    wecom_logged_in=wecom_logged_in, auto_send=auto_send)
+        try:
+            return self.request('/v1/device/heartbeat', {'session_id':self.session_id, **body})
+        except GatewaySessionError:
+            self.hello()
+            return self.request('/v1/device/heartbeat', {'session_id':self.session_id, **body})
 
     def claim(self):
         return self.request('/v1/device/tasks/claim',{'session_id':self.session_id})['task']
@@ -122,5 +151,6 @@ class GatewayClient:
                 attempt+=1
                 # Full jitter prevents all clients reconnecting at the same instant.
                 delay=random.uniform(.5,min(60,2**min(attempt,6)))
-                try:await asyncio.wait_for(stop_event.wait(),timeout=delay)
-                except TimeoutError:pass
+                # Native callers pass threading.Event: wait() would block this
+                # event loop forever before wait_for could install its timeout.
+                await asyncio.sleep(delay)

@@ -10,7 +10,7 @@ import statistics
 import sys
 import time
 import uuid
-from collections import Counter
+from collections import Counter,deque
 from pathlib import Path
 import httpx
 import websockets
@@ -31,24 +31,33 @@ async def main():
     parser.add_argument('--task-seconds',type=int,default=30)
     parser.add_argument('--output',required=True)
     parser.add_argument('--base',default='https://127.0.0.1:38443')
+    parser.add_argument('--state-dir',default='')
+    parser.add_argument('--ws-bases',default='')
     args=parser.parse_args()
-    if not args.base.startswith('https://127.0.0.1:38443'):raise ValueError('This harness is restricted to the dedicated local TLS environment')
+    ws_bases=args.ws_bases.split(',') if args.ws_bases else [args.base]
+    if any(url not in ('https://127.0.0.1:38443','https://127.0.0.1:39443','https://127.0.0.1:39445','https://127.0.0.1:39447','https://127.0.0.1:39449') for url in ws_bases):raise ValueError('Unknown sandbox websocket origin')
+    if args.base not in ('https://127.0.0.1:38443','https://127.0.0.1:39443'):raise ValueError('Use only the owned local lab or the user-selected UAT sandbox tunnel')
     root=Path(__file__).resolve().parents[1]
-    state=root/'runtime/scale-local'
+    state=Path(args.state_dir) if args.state_dir else root/'runtime/scale-local'
     context=ssl.create_default_context(cafile=str(state/'cert.pem'))
     admin={'Authorization':'Bearer '+(state/'admin_token').read_text().strip()}
     backend={'Authorization':'Bearer '+(state/'backend_token').read_text().strip()}
     verifier={'Authorization':'Bearer '+(state/'verifier_token').read_text().strip()}
     tenant='load_'+uuid.uuid4().hex[:12]
     prefix='sim_'+uuid.uuid4().hex[:12]
-    latencies=[];errors=Counter();notification_times={};dispatch=[];devices=[];sockets=[]
+    latencies=deque(maxlen=100000);request_count=0;errors=Counter();notification_times={};dispatch=[];devices=[];sockets=[]
     task_ids=set();confirmed=set();receivers=[];send_locks=[];start=time.monotonic();finished=asyncio.Event()
-    transport=httpx.AsyncHTTPTransport(verify=context,retries=0,limits=httpx.Limits(max_connections=128,max_keepalive_connections=128))
+    transport=httpx.AsyncHTTPTransport(verify=context,retries=0,limits=httpx.Limits(max_connections=48,max_keepalive_connections=48))
+    # Bound callers before httpcore's connection pool: a synchronized heartbeat burst
+    # must not make every queued request repeatedly scan all persistent sockets.
+    http_slots=asyncio.Semaphore(48)
     async with httpx.AsyncClient(base_url=args.base,transport=transport,timeout=15) as http:
         async def request(method,path,headers,body=None):
+            nonlocal request_count
             began=time.monotonic()
-            response=await http.request(method,path,headers=headers,json=body)
-            latencies.append(time.monotonic()-began)
+            async with http_slots:
+                response=await http.request(method,path,headers=headers,json=body)
+            latencies.append(time.monotonic()-began);request_count+=1
             if response.status_code!=200:
                 errors[str(response.status_code)]+=1
                 raise RuntimeError('Unexpected HTTP '+str(response.status_code)+' at '+path.split('/')[2])
@@ -79,16 +88,16 @@ async def main():
                                 notification_times.setdefault(task['id'],time.monotonic())
                 except Exception:
                     if not finished.is_set():errors['ws_disconnect']+=1
-            async def connect(d):
+            async def connect(index,d):
                 async with sem:
-                    ws=await websockets.connect(args.base.replace('https://','wss://')+'/v1/device/notifications',ssl=context,
+                    ws=await websockets.connect(ws_bases[index%len(ws_bases)].replace('https://','wss://')+'/v1/device/notifications',ssl=context,
                                                 open_timeout=15,ping_interval=20,ping_timeout=20,max_size=64*1024)
                     await ws.send(json.dumps({'token':d['token'],'session_id':d['session']}))
                     initial=json.loads(await asyncio.wait_for(ws.recv(),15))
                     assert initial['type']=='tasks_changed'
                     receivers.append(asyncio.create_task(receive(ws)))
                     sockets.append(ws);send_locks.append(asyncio.Lock())
-            await asyncio.gather(*(connect(d) for d in devices))
+            await asyncio.gather(*(connect(i,d) for i,d in enumerate(devices)))
             connected_at=time.monotonic()
             print(json.dumps({'phase':'connected','clients':len(sockets),'seconds':round(connected_at-start,2)}),flush=True)
             async def keepalive(index,d):
@@ -144,22 +153,29 @@ async def main():
                 jobs.append(asyncio.create_task(job(i)))
                 await asyncio.sleep(max(0,task_start+(i+1)/args.tasks_per_second-time.monotonic()))
             results=await asyncio.gather(*jobs,return_exceptions=True)
+            task_run_seconds=time.monotonic()-task_start
             for result in results:
                 if isinstance(result,Exception):errors[type(result).__name__]+=1
             remain=max(0,args.seconds-(time.monotonic()-connected_at))
             while remain>0:
                 await asyncio.sleep(min(10,remain))
-                print(json.dumps({'phase':'hold','clients':len(sockets),'confirmed':len(confirmed),'elapsed_seconds':round(time.monotonic()-connected_at,2)}),flush=True)
+                progress={'phase':'hold','clients':len(sockets),'confirmed':len(confirmed),'elapsed_seconds':round(time.monotonic()-connected_at,2),'request_count':request_count,'error_counts':dict(errors),'planned_seconds':args.seconds,'real_wecom_messages_sent':0}
+                progress_path=Path(args.output).with_suffix('.progress.json');temp=progress_path.with_suffix('.tmp');temp.write_text(json.dumps(progress,indent=2));temp.replace(progress_path)
+                print(json.dumps(progress),flush=True)
                 remain=max(0,args.seconds-(time.monotonic()-connected_at))
             status=await request('GET',f'/v1/admin/{tenant}/status',admin)
             online=sum(not d['stale'] for d in status['devices'])
-            result={'scope':'local_two_instances_tls_wss_synthetic','clients':args.clients,'online_at_end':online,
+            open_sockets=sum(ws.state.name=='OPEN' for ws in sockets)
+            result={'scope':'uat_independent_sandbox_over_ssh_tls' if args.base.endswith(':39443') else 'local_two_instances_tls_wss_synthetic','clients':args.clients,'online_at_end':online,
+                'websockets_open_at_end':open_sockets,'task_run_seconds':round(task_run_seconds,3),
+                'achieved_confirmed_tasks_per_second':round(len(confirmed)/task_run_seconds,3),
                 'connected_hold_seconds':round(time.monotonic()-connected_at,3),'expected_tasks':count,'unique_created':len(task_ids),
-                'unique_confirmed':len(confirmed),'request_samples':len(latencies),'http_p95_ms':percentile(latencies,.95),
+                'unique_confirmed':len(confirmed),'request_samples':len(latencies),'request_count':request_count,'latency_window_last_requests':100000,'http_p95_ms':percentile(latencies,.95),
                 'http_p99_ms':percentile(latencies,.99),'notification_p95_ms':percentile(dispatch,.95),
                 'notification_p99_ms':percentile(dispatch,.99),'errors':dict(errors),'real_wecom_messages_sent':0,
-                'load_generator_and_services_same_host':True,'long_soak_validated':False,
-                'passed':online==args.clients and not errors and len(confirmed)==count}
+                'load_generator_and_services_same_host':args.base.endswith(':38443'),'long_soak_validated':False,
+                'passed':online==args.clients and open_sockets==args.clients and not errors and len(confirmed)==count,
+                'latency_targets_met':bool(latencies and dispatch and percentile(latencies,.95)<200 and percentile(dispatch,.95)<500)}
             Path(args.output).write_text(json.dumps(result,indent=2)+'\n')
             print(json.dumps(result),flush=True)
         finally:
