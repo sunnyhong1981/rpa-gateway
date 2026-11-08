@@ -245,7 +245,16 @@ class SourceQueue:
             if old is None:
                 ready=db.execute("SELECT count(*) n FROM tasks WHERE tenant=%s AND device=%s AND state IN ('queued','leased','submitting','submitted','unknown')",
                                  (job['tenant'],job['device'])).fetchone()['n']
-                if ready>=self.settings.ready_per_device:
+                # Reserve the last ready slot for the earliest unpublished reply.
+                # Otherwise later prepared tasks could fill the buffer while
+                # dispatch waits for the earlier reply that cannot be admitted.
+                earlier=db.execute("""SELECT 1 FROM source_jobs j JOIN source_routes r
+                  ON r.tenant=j.tenant AND r.inbox=j.inbox
+                  WHERE j.tenant=%s AND r.device=%s AND r.mode='gateway'
+                  AND j.message_id>r.floor AND j.message_id<%s
+                  AND j.task IS NULL AND j.state IN ('pending','preparing') LIMIT 1""",
+                  (job['tenant'],job['device'],job['message_id'])).fetchone()
+                if ready+int(earlier is not None)>=self.settings.ready_per_device:
                     db.execute("UPDATE source_jobs SET state='pending',next_at=%s,attempts=GREATEST(0,attempts-1),lease_token=NULL,lease_until=NULL WHERE tenant=%s AND inbox=%s AND message_id=%s",
                                (now+.5,job['tenant'],job['inbox'],job['message_id']))
                     return None
