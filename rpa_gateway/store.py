@@ -5,12 +5,13 @@ import time
 import uuid
 import redis
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from fastapi import HTTPException
 from .database import Database
 
 ACTIVE = ('leased', 'submitting', 'submitted', 'unknown')
 TERMINAL = ('confirmed', 'failed', 'expired', 'cancelled', 'closed_unconfirmed')
+MAX_PENDING_ARCHIVES = 3
 
 
 def fail(code, message):
@@ -26,6 +27,7 @@ class Store:
         self.clock = clock
         self.presence = presence
         self.objects = objects
+        self.source_validator = None
         self.database = Database(dsn, pool_size=pool_size)
         self.database.initialize()
 
@@ -71,10 +73,12 @@ class Store:
                 "ORDER BY d.tenant,d.id LIMIT 100 FOR UPDATE OF d SKIP LOCKED", (now,now)).fetchall()
         else:
             devices = [device]
+        affected = 0
         for owner in devices:
             rows = db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND " + due + " ORDER BY id FOR UPDATE",
                               (owner['tenant'],owner['id'],now,now)).fetchall()
             for task in rows:
+                affected += 1
                 state = task['state']
                 if state in ('queued','leased') and task['deadline'] <= now:
                     self.transition(db, task, 'expired', {'reason':'request_deadline'})
@@ -82,6 +86,7 @@ class Store:
                     self.transition(db, task, 'queued', {'reason':'pre_submit_lease_expired'})
                 elif state in ('submitting','submitted') and task['lease_until'] <= now:
                     self.transition(db, task, 'unknown', {'reason':'archive_or_submission_timeout_no_retry'})
+        return affected
 
     def device(self, token):
         token_hash=digest(token)
@@ -183,6 +188,8 @@ class Store:
         from .objects import verify_image
         meta=_verified or verify_image(data)
         sha=meta['sha256']
+        cached=self.cached_media(tenant,sha)
+        if cached:return cached
         object_key=None
         if self.objects:
             object_key=self.objects.key(tenant,sha)+'-'+uuid.uuid4().hex
@@ -200,7 +207,13 @@ class Store:
             # delayed orphan reconciliation checks the database before any object deletion.
             raise
 
-    def create_task(self, tenant, body):
+    def cached_media(self,tenant,sha):
+        with self.transaction() as db:
+            row=db.execute('SELECT id,sha256,md5,size,mime FROM media WHERE tenant=%s AND sha256=%s AND deleting=false',
+                           (tenant,sha)).fetchone()
+            return dict(row) if row else None
+
+    def create_task(self, tenant, body, *, transaction=None):
         payload = body.model_dump()
         if len(set(body.media_ids)) != len(body.media_ids):
             fail(422, 'Duplicate media in one task')
@@ -208,7 +221,7 @@ class Store:
         identity = [body.inbox_id,body.source_message_id,body.waybill,'caption_images' if body.media_ids else 'text']
         dedup = digest(json.dumps(identity))
         canonical = json.dumps(payload, sort_keys=True)
-        with self.transaction() as db:
+        with (self.transaction() if transaction is None else nullcontext(transaction)) as db:
             old = db.execute('SELECT * FROM tasks WHERE tenant=%s AND dedup=%s', (tenant,dedup)).fetchone()
             if old:
                 if old['payload'] != canonical:
@@ -241,7 +254,7 @@ class Store:
             return self.present(task)
 
     def present(self, task, device_view=False, db=None):
-        result = {k: task[k] for k in ('id','tenant','device','state','created','deadline','updated')}
+        result = {k: task[k] for k in ('id','tenant','device','state','created','deadline','updated','desktop_released_at')}
         result['payload'] = json.loads(task['payload'])
         if device_view:
             # Immutable expected hashes accompany the task, independent of download headers.
@@ -257,9 +270,13 @@ class Store:
         with self.transaction() as db:
             row = self.session(db, device, body.session_id, ready=True, lock=True)
             self.sweep(db, row)
-            if db.execute('SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state IN (%s,%s,%s,%s)',
-                          (row['tenant'],row['id'],*ACTIVE)).fetchone():
+            if db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND (state IN ('leased','submitting','unknown') OR (state='submitted' AND desktop_released_at IS NULL))",
+                          (row['tenant'],row['id'])).fetchone():
                 return {'task': None, 'reason': 'device_busy_or_awaiting_confirmation'}
+            pending=db.execute("SELECT count(*) n FROM tasks WHERE tenant=%s AND device=%s AND state='submitted' AND desktop_released_at IS NOT NULL",
+                               (row['tenant'],row['id'])).fetchone()['n']
+            if pending>=MAX_PENDING_ARCHIVES:
+                return {'task':None,'reason':'archive_confirmation_backlog'}
             hello = json.loads(row['hello'])
             caps = set(hello['capabilities'])
             task = db.execute("SELECT * FROM tasks WHERE tenant=%s AND device=%s AND state='queued' ORDER BY created,id LIMIT 1 FOR UPDATE SKIP LOCKED",
@@ -294,6 +311,8 @@ class Store:
             old = db.execute('SELECT * FROM events WHERE task=%s AND event_id=%s',(task_id,body.event_id)).fetchone()
             receipt_body = body.model_dump()
             receipt_body.pop('lease_token')
+            if body.state!='desktop_released':
+                for field in ('native_submit_complete','input_cleared','group_verified'):receipt_body.pop(field)
             if old:
                 if json.loads(old['details']) != receipt_body:
                     fail(409,'Receipt idempotency conflict')
@@ -308,12 +327,32 @@ class Store:
                 if state != 'leased':
                     fail(409,'Submission requires a live unsubmitted lease')
                 self.session(db,device,body.session_id,ready=True)
+                if db.execute("SELECT 1 FROM tasks WHERE tenant=%s AND device=%s AND state='unknown' AND id<>%s",
+                              (owner['tenant'],owner['id'],task_id)).fetchone():
+                    fail(409,'Uncertain work requires reconciliation before another native Enter')
+                snapshot=json.loads(task['payload'])
+                if (snapshot.get('context') or {}).get('source_fingerprint'):
+                    if self.source_validator is None:fail(503,'Official source validator unavailable; no Enter allowed')
+                    self.source_validator(snapshot)
                 # This is the irreversible fence. A timeout after this is unknown, never requeued.
                 db.execute("UPDATE tasks SET state='submitting',intent_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
             elif body.state == 'submitted':
-                if state != 'submitting':
+                if state == 'confirmed' and task['intent_at'] is not None and task['submitted_at'] is None:
+                    # The official archive can beat this HTTP receipt. Record its
+                    # actual arrival time, retaining confirmed and never authorizing Enter.
+                    db.execute('UPDATE tasks SET submitted_at=%s WHERE id=%s',(now,task_id))
+                elif state == 'submitting':
+                    db.execute("UPDATE tasks SET state='submitted',submitted_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
+                else:
                     fail(409,'Submit intent must be durably acknowledged before UI Enter')
-                db.execute("UPDATE tasks SET state='submitted',submitted_at=%s,lease_until=%s,updated=%s WHERE id=%s",(now,now+90,now,task_id))
+            elif body.state == 'desktop_released':
+                if not all((body.native_submit_complete,body.input_cleared,body.group_verified)):
+                    fail(409,'Native submission, cleared input and exact group must all be verified')
+                if state not in ('submitted','confirmed') or task['submitted_at'] is None:
+                    fail(409,'Desktop can only be released after a persisted submitted receipt')
+                if task['desktop_released_at'] is not None:
+                    fail(409,'Desktop release already recorded; retry the original event identity')
+                db.execute('UPDATE tasks SET desktop_released_at=%s,updated=%s WHERE id=%s',(now,now,task_id))
             elif body.state == 'unknown':
                 if state not in ('submitting','submitted','unknown'):
                     fail(409,'No submission intent exists')
@@ -355,6 +394,13 @@ class Store:
                                               (device['tenant'],device['id']))]
             return {'type':'tasks_changed','tasks':tasks,'cursor':row['revision'],'claim_via':'HTTPS'}
 
+    def device_task(self,device,task_id):
+        with self.transaction() as db:
+            task=self.owned_task(db,device,task_id)
+            result=self.present(task)
+            result.update(intent_at=task['intent_at'],submitted_at=task['submitted_at'])
+            return result
+
     def lookup_task(self, db, tenant, task_id, sweep=False):
         task = db.execute('SELECT * FROM tasks WHERE tenant=%s AND id=%s',(tenant,task_id)).fetchone()
         if task is None:
@@ -388,7 +434,12 @@ class Store:
                    e.occurred_at > task['intent_at']+600 for e in events):
                 fail(422,'Archive scope, actor or submission time mismatch')
             text = [e.text for e in events if e.kind=='text']
-            if text != [payload['caption']]:
+            allowed=[payload['caption']]
+            context=payload.get('context') or {}
+            name=(context.get('reply_target') or {}).get('sender_name','')
+            if context.get('provider')=='chatwoot_official' and name and len(name)<=120:
+                allowed.extend(['@'+name+' '+payload['caption'], '回复 '+name+'：\n'+payload['caption']])
+            if len(text)!=1 or text[0] not in allowed:
                 fail(422,'Expected exact single caption')
             expected = Counter()
             for media_id in payload['media_ids']:
